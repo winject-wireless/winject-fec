@@ -1,4 +1,4 @@
-/* Read stream: delivery on arrival, block rebuild, spread estimate and give-up. */
+/* Read stream: in-order release, block rebuild, spread estimate and give-up. */
 #include "winject_fec/read_stream.hpp"
 
 #include <algorithm>
@@ -67,11 +67,10 @@ struct fec_read_stream::impl : std::enable_shared_from_this<impl>
 {
     struct rx_slot
     {
-        /* The data shard's payload, kept while a block may still rebuild with it. */
+        /* The app datagram (received or rebuilt); empty = none. Kept past its release while a
+         * block may still rebuild with it. */
         bfc::shared_sized_buffer payload;
         uint16_t                 seq = 0;
-        /* Delivered (received or rebuilt): a later copy is a duplicate. */
-        bool released = false;
         /* Received (not rebuilt): its arrival dates its block's close. */
         bool       received = false;
         time_point at {};
@@ -100,7 +99,7 @@ struct fec_read_stream::impl : std::enable_shared_from_this<impl>
     std::vector<rx_slot>         ring = std::vector<rx_slot>(k_rx_ring);
     std::map<uint16_t, rx_block> rx_blocks; /* keyed by base; ordered via seq_dist when needed */
     bool                         emit_base_set = false;
-    /* The give-up point: every data shard before it is delivered or given up. */
+    /* The next data shard to release: every one before it is released or given up. */
     uint16_t emit_next = 0;
     uint16_t highest_seen = 0;
     /* Newest block seen in parity, for holes whose block has no parity yet. Blocks after it are
@@ -424,7 +423,7 @@ struct fec_read_stream::impl : std::enable_shared_from_this<impl>
         block->arrivals.clear();
     }
 
-    /* A block is done once all its data is behind the give-up point and its parity has all come
+    /* A block is done once all its data is behind the release point and its parity has all come
      * (or stopped coming). It is forgotten once parity for it would be too late to look at. */
     void prune_blocks(time_point t)
     {
@@ -447,7 +446,7 @@ struct fec_read_stream::impl : std::enable_shared_from_this<impl>
         }
     }
 
-    /* When a block behind the give-up point stops waiting for its last parity. */
+    /* When a block behind the release point stops waiting for its last parity. */
     bool next_quiet(time_point* at) const
     {
         bool found = false;
@@ -523,24 +522,23 @@ struct fec_read_stream::impl : std::enable_shared_from_this<impl>
             const uint16_t           seq = block->dec.get_state().seq;
             bfc::shared_sized_buffer payload = block->dec.pop();
             rx_slot*                 s = slot_for(seq);
-            if ((s->seq == seq && s->released) || seq_dist(seq, emit_next) < 0)
+            if ((s->seq == seq && !s->payload.empty()) || seq_dist(seq, emit_next) < 0)
             {
-                continue; /* delivered, or given up already */
+                continue; /* arrived meanwhile, or given up already */
             }
-            s->payload = payload;
+            /* Released in sequence by resolve(). */
+            s->payload = std::move(payload);
             s->seq = seq;
-            s->released = true;
             s->received = false;
             s->at = t;
             c_recovered++;
-            emit(std::move(payload));
         }
         block_done(block);
     }
 
-    /* --- give-up point --- */
+    /* --- in-order release --- */
 
-    /* A block needing a rebuild has data at or past the give-up point and is at most
+    /* A block needing a rebuild has data at or past the release point and is at most
      * k_header_k_n_max long, so a payload further behind than that is never read again. */
     void advance_emit()
     {
@@ -588,7 +586,7 @@ struct fec_read_stream::impl : std::enable_shared_from_this<impl>
         c_new_ref++;
     }
 
-    /* Moves the give-up point over everything delivered and over holes past their deadline. */
+    /* Releases everything that can go out in sequence and gives up holes past their deadline. */
     void resolve(time_point t)
     {
         hole_wait = false;
@@ -599,14 +597,21 @@ struct fec_read_stream::impl : std::enable_shared_from_this<impl>
         while (seq_dist(highest_seen, emit_next) >= 0)
         {
             rx_slot* s = slot_for(emit_next);
-            if (s->seq == emit_next && s->released)
+            if (s->seq == emit_next && !s->payload.empty())
             {
+                /* The ring keeps its own handle: the block may still need it to rebuild a later
+                 * hole. */
+                if (s->received)
+                {
+                    c_data++;
+                }
+                emit(s->payload);
                 advance_emit();
                 hole_timed = false;
                 continue;
             }
             /* A run of holes shares one wait: it starts at the first hole and ends at the next
-             * shard delivered. */
+             * shard released. */
             if (!hole_timed)
             {
                 hole_timed = true;
@@ -720,25 +725,25 @@ struct fec_read_stream::impl : std::enable_shared_from_this<impl>
             highest_seen = static_cast<uint16_t>(seq - 1);
         }
         rx_slot* s = slot_for(seq);
-        if (s->seq == seq && s->released)
+        if (s->seq == seq && !s->payload.empty())
         {
             c_dup++; /* duplicate, or already rebuilt */
             return;
         }
-        bfc::shared_sized_buffer payload = shard.subview(h.header_len, shard.size() - h.header_len);
-        const int                behind = -seq_dist(seq, emit_next);
-        if (behind > 0)
+        if (seq_dist(seq, emit_next) < 0)
         {
+            /* Behind the release point: never released, but it may still help a block rebuild a
+             * hole that is not given up yet. */
             c_late++;
+            if (seq_dist(seq, emit_next) < -k_header_k_n_max)
+            {
+                return; /* too far behind to help any block still rebuilding */
+            }
         }
-        /* Too far behind to help any block still rebuilding: delivered, not kept. */
-        s->payload = behind > k_header_k_n_max ? bfc::shared_sized_buffer {} : payload;
+        s->payload = shard.subview(h.header_len, shard.size() - h.header_len);
         s->seq = seq;
-        s->released = true;
         s->received = true;
         s->at = t;
-        c_data++;
-        emit(std::move(payload));
         if (seq_dist(seq, highest_seen) > 0)
         {
             highest_seen = seq;
@@ -775,7 +780,7 @@ struct fec_read_stream::impl : std::enable_shared_from_this<impl>
         else if (d + h.k_total < -k_max_lo_seq_deviation)
         {
             /* Spread parity trails its block, so parity of a block far behind is late, not a new
-             * session: a new session behind the give-up point is found by its data. */
+             * session: a new session behind the release point is found by its data. */
             return;
         }
         /* The block's data all exists at the sender, so a lost last data shard is a hole too. */

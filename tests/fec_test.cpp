@@ -384,7 +384,7 @@ TEST(FecReadStream, RecoversEveryPairOfErasures)
                     rx.push(all[static_cast<size_t>(i)].data);
                 }
             }
-            EXPECT_EQ(by_index(rx.got), apps) << "lost " << a << "," << b;
+            EXPECT_EQ(rx.got, apps) << "lost " << a << "," << b;
             EXPECT_EQ(rx.c().decode_fail, 0u);
         }
     }
@@ -412,10 +412,10 @@ TEST(FecReadStream, Kn20N31MaxErasures)
     {
         rx.push(all[order[i]].data);
     }
-    EXPECT_EQ(by_index(rx.got), apps);
+    EXPECT_EQ(rx.got, apps);
 }
 
-TEST(FecReadStream, DeliversOnArrivalRebuildsLate)
+TEST(FecReadStream, ParityAfterNextBlockDataStillInOrder)
 {
     std::mt19937 rng(4);
     sender       tx(4, 6);
@@ -423,22 +423,19 @@ TEST(FecReadStream, DeliversOnArrivalRebuildsLate)
     auto         all = tx.encode_all(apps); /* d0..d3 p0 p1 d4..d7 p0 p1 */
     ASSERT_EQ(all.size(), 12u);
     receiver rx;
-    /* Block 0 loses d1; its parity is spread past block 1's data. Nothing waits behind it. */
+    /* Block 0 loses d1; its parity is spread past block 1's data. */
     for (size_t i : {0, 2, 3, 6, 7})
     {
         rx.push(all[i].data);
     }
-    ASSERT_EQ(rx.got.size(), 5u);
-    EXPECT_EQ(app_index(rx.got[1]), 2u);
-    EXPECT_EQ(app_index(rx.got[3]), 4u);
-    rx.push(all[4].data); /* block 0's parity row 0 rebuilds d1 */
-    ASSERT_EQ(rx.got.size(), 6u);
-    EXPECT_EQ(rx.got[5], apps[1]);
+    EXPECT_EQ(rx.got.size(), 1u); /* d0; the rest waits behind the hole */
+    rx.push(all[4].data);         /* block 0's parity row 0 rebuilds d1 */
+    EXPECT_EQ(rx.got.size(), 6u);
     for (size_t i : {8, 9, 5, 10, 11})
     {
         rx.push(all[i].data);
     }
-    EXPECT_EQ(by_index(rx.got), apps);
+    EXPECT_EQ(rx.got, apps);
     EXPECT_EQ(rx.c().recovered, 1u);
     EXPECT_EQ(rx.c().data, 7u);
 }
@@ -456,7 +453,7 @@ TEST(FecReadStream, FlushedPartialBlockRecovers)
     rx.push(all[3].data);
     rx.push(parity[0].data);
     rx.push(parity[2].data);
-    EXPECT_EQ(by_index(rx.got), apps);
+    EXPECT_EQ(rx.got, apps);
 }
 
 TEST(FecReadStream, RuntimeKnChangeKeepsSequence)
@@ -485,7 +482,7 @@ TEST(FecReadStream, RuntimeKnChangeKeepsSequence)
             rx.push(all[i].data);
         }
     }
-    EXPECT_EQ(by_index(rx.got), apps);
+    EXPECT_EQ(rx.got, apps);
     EXPECT_EQ(rx.c().decode_fail, 0u);
 }
 
@@ -503,7 +500,7 @@ TEST(FecReadStream, SequenceWrapNoLoss)
             rx.push(all[i].data);
         }
     }
-    EXPECT_EQ(by_index(rx.got), apps);
+    EXPECT_EQ(rx.got, apps);
 }
 
 TEST(FecReadStream, HoleWithoutParityGivenUpAtCapThenAtEstimate)
@@ -526,7 +523,7 @@ TEST(FecReadStream, HoleWithoutParityGivenUpAtCapThenAtEstimate)
         rx.push(all[i].data);
         clk.advance(1);
     }
-    EXPECT_EQ(rx.got.size(), 3u); /* delivered on arrival, the hole does not hold them */
+    EXPECT_EQ(rx.got.size(), 2u); /* d3 waits behind the hole */
     /* No estimate yet: the hole waits about the 250 ms cap from its block's close. */
     fec_read_stream::time_point at {};
     ASSERT_TRUE(rx.rs.next_deadline(&at));
@@ -537,6 +534,7 @@ TEST(FecReadStream, HoleWithoutParityGivenUpAtCapThenAtEstimate)
     clk.advance(60);
     rx.poll();
     EXPECT_EQ(lost(), 1u);
+    EXPECT_EQ(rx.got.size(), 3u);
     EXPECT_EQ(rx.c().given_up_blocks, 1u);
 
     /* k = 4, n = 2 (c = 6), spread 12 ms: row gap 2 ms. The sender releases parity row j at
@@ -677,7 +675,7 @@ TEST(FecReadStream, PeerRestartTakesNewReference)
     EXPECT_EQ(rx.c().new_references, 1u);
 }
 
-TEST(FecReadStream, LateDataDeliveredOnceDuplicatesDropped)
+TEST(FecReadStream, LateDataBehindReleaseIgnored)
 {
     sender             tx(1, 1);
     std::vector<bytes> wire;
@@ -695,16 +693,14 @@ TEST(FecReadStream, LateDataDeliveredOnceDuplicatesDropped)
     }
     ASSERT_EQ(rx.got.size(), 299u);
     EXPECT_EQ(rx.c().missing_data, 1u);
-    /* Late, behind the give-up point: the app never had it, so it goes out. */
+    /* Late, behind the release point: released in order it would come after 299. */
     rx.push(wire[290]);
-    ASSERT_EQ(rx.got.size(), 300u);
-    EXPECT_EQ(rx.got.back(), make_app(290, 10));
+    EXPECT_EQ(rx.got.size(), 299u);
     EXPECT_EQ(rx.c().late, 1u);
     EXPECT_EQ(rx.c().new_references, 0u);
-    rx.push(wire[290]);
     rx.push(wire[299]);
-    EXPECT_EQ(rx.got.size(), 300u);
-    EXPECT_EQ(rx.c().duplicates, 2u);
+    EXPECT_EQ(rx.got.size(), 299u);
+    EXPECT_EQ(rx.c().duplicates, 1u);
 }
 
 TEST(FecReadStream, KnMismatchCounted)
@@ -840,7 +836,7 @@ TEST(FecReadStream, ShortFlushedBlockKeepsNextBlockWait)
     }
     ASSERT_EQ(parity.size(), 2u);
     rx.push(parity[0].data);
-    EXPECT_EQ(by_index(rx.got), apps);
+    EXPECT_EQ(rx.got, apps);
     EXPECT_EQ(rx.c().given_up_blocks, 0u);
 }
 
@@ -879,7 +875,7 @@ TEST(FecReadStream, RandomLossStreamRecoversWithinParity)
         }
         rx.push(all[i].data);
     }
-    EXPECT_EQ(by_index(rx.got), apps);
+    EXPECT_EQ(rx.got, apps);
     EXPECT_EQ(rx.c().decode_fail, 0u);
     EXPECT_GT(rx.c().recovered, 0u);
 }

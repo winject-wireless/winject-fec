@@ -43,12 +43,6 @@ std::vector<uint8_t> decode_order(receiver &rx, const std::vector<std::vector<ui
     return tags;
 }
 
-std::vector<uint8_t> sorted(std::vector<uint8_t> v)
-{
-    std::sort(v.begin(), v.end());
-    return v;
-}
-
 }  // namespace
 
 TEST(FecSpreadTest, OffsetsTileTheWindow)
@@ -62,8 +56,8 @@ TEST(FecSpreadTest, OffsetsTileTheWindow)
     EXPECT_EQ(spread_offset(5, 0, 20), microseconds(0));
 }
 
-/* Receiver in a running stream: shards of two blocks arriving interleaved all come out, with a
- * loss in each (including the first shard of the earlier block). */
+/* Receiver in a running stream: shards of two blocks arriving interleaved decode in order,
+ * with a loss in each (including the first shard of the earlier block). */
 TEST(FecSpreadTest, ReceiverDecodesInterleavedBlocks)
 {
     sender tx(4, 6, 96);
@@ -83,12 +77,12 @@ TEST(FecSpreadTest, ReceiverDecodesInterleavedBlocks)
     receiver dec;
     EXPECT_EQ((std::vector<uint8_t> {90, 91, 92, 93}),
               decode_order(dec, prior, std::vector<bool>(prior.size(), false)));
-    EXPECT_EQ((std::vector<uint8_t> {1, 2, 3, 4, 5, 6, 7, 8}), sorted(decode_order(dec, wire, lost)));
+    EXPECT_EQ((std::vector<uint8_t> {1, 2, 3, 4, 5, 6, 7, 8}), decode_order(dec, wire, lost));
 }
 
-/* Start-up edge case: a fresh receiver anchors its give-up point on the first data shard it
+/* Start-up edge case: a fresh receiver anchors in-order release on the first data shard it
  * sees. If the earlier block's first shard is lost and a later block's arrives first, the
- * earlier block is behind it: its data is late (still delivered), its hole not rebuilt. */
+ * earlier block is behind the reference: late, and ignored. */
 TEST(FecSpreadTest, FreshReceiverAnchorsOnFirstShardSeen)
 {
     sender tx(4, 6);
@@ -103,9 +97,8 @@ TEST(FecSpreadTest, FreshReceiverAnchorsOnFirstShardSeen)
     std::vector<bool> lost(wire.size(), false);
     lost[0] = true;  // A data 0: B data 0 is the first shard this receiver sees
     receiver dec;
-    EXPECT_EQ((std::vector<uint8_t> {5, 2, 6, 3, 7, 4, 8}), decode_order(dec, wire, lost));
+    EXPECT_EQ((std::vector<uint8_t> {5, 6, 7, 8}), decode_order(dec, wire, lost));
     EXPECT_EQ(dec.c().late, 3u);
-    EXPECT_EQ(dec.c().recovered, 0u);
 }
 
 /* A burst of 4 consecutive wire losses: sent back to back it takes 4 shards of one 4/6 block
@@ -140,6 +133,6 @@ TEST(FecSpreadTest, InterleavingSurvivesBurst)
     receiver dec_mixed;
     (void)decode_order(dec_mixed, prior, none);
     EXPECT_EQ((std::vector<uint8_t> {1, 2, 3, 4, 5, 6, 7, 8}),
-              sorted(decode_order(dec_mixed, mixed, burst)));
+              decode_order(dec_mixed, mixed, burst));
 }
 

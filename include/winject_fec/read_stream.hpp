@@ -21,25 +21,26 @@ using read_output_queue = bfc::reactive_circular_lossy_queue<bfc::shared_sized_b
 /*
  * The receiving side of a FEC stream: push() what the link received, pop() app datagrams.
  *
- * Plain datagrams and data shards go out the moment they arrive (a data shard as a view of the
- * received buffer past its header), so nothing waits behind a hole and output is NOT in sequence
- * order. A data row lost on the air is rebuilt from its block's parity (block_decoder) and goes
- * out as soon as it is. The stream keeps a reference to recent data shards until their blocks
- * can no longer need them for a rebuild: memory, not copies.
+ * Plain datagrams go out at once. Data shards go out in sequence, each as a view of the received
+ * buffer past its header: in order, one at once; behind a hole, when the hole is rebuilt from its
+ * block's parity (block_decoder) or given up. The order matters to consumers such as an RTP
+ * depacketizer, which drops a packet that comes after a later one. The stream keeps a reference
+ * to recent data shards until their blocks can no longer need them for a rebuild: memory, not
+ * copies.
  *
  * Give-up: the sender releases parity row j of a block of c shards at
  * max(close + j*spread/c, first + (k_total + j)*spread/c), where close and first are when its
  * last and first data shards were pushed. The receiver learns the spread from the row gap of each
  * block's parity arrivals, and the bias and jitter of the last parity's arrival against that rule.
- * A missing data shard is given up (counted lost, its block's references dropped) when its block's
+ * A missing data shard is given up (counted lost, the data behind it released) when its block's
  * last parity is due + bias + a margin from the jitter. Until two blocks have been measured the
  * wait is k_spread_cap_ms after the close. Without parity (a data-only stream) a hole is given up
  * as soon as a later data shard shows the sender is past it. One reactor timer, armed at the
  * earliest give-up, drives it.
  *
- * Ids: a data shard behind the give-up point by at most k_max_lo_seq_deviation is late (still
- * delivered if it never was); behind by more, or ahead by more than k_max_hi_seq_deviation, it
- * starts a new reference (a new sender session: old state is dropped).
+ * Ids: a data shard behind the next one to release by at most k_max_lo_seq_deviation is late and
+ * not released; behind by more, or ahead by more than k_max_hi_seq_deviation, it starts a new
+ * reference (a new sender session: old state is dropped).
  *
  * Output: a bfc lossy ring (output()); bind it to the consumer's reactor or poll pop(). Threads
  * and manual mode as fec_write_stream.
@@ -100,9 +101,9 @@ public:
     struct counters
     {
         uint64_t plain = 0;
-        /* Data shards delivered as received. */
+        /* Data shards released as received. */
         uint64_t data = 0;
-        /* Data rows rebuilt and delivered. */
+        /* Data rows rebuilt from parity. */
         uint64_t recovered = 0;
         /* Blocks rebuilt from parity. */
         uint64_t blocks = 0;
@@ -115,7 +116,7 @@ public:
         uint64_t missing_data = 0;
         /* Parity shards never seen, counted when their block is done (wire loss). */
         uint64_t missing_parity = 0;
-        /* Data shards behind the give-up point (delivered when they never were). */
+        /* Data shards behind the next one to release (not released). */
         uint64_t late = 0;
         uint64_t duplicates = 0;
         uint64_t new_references = 0;

@@ -50,14 +50,6 @@ inline uint32_t app_index(const bytes& b)
     return i;
 }
 
-/* Output is delivered as it arrives or is rebuilt: compare as the set the app gets. */
-inline std::vector<bytes> by_index(std::vector<bytes> v)
-{
-    std::stable_sort(v.begin(), v.end(),
-                     [](const bytes& a, const bytes& b) { return app_index(a) < app_index(b); });
-    return v;
-}
-
 inline std::vector<bytes> make_apps(size_t count, std::mt19937* rng, size_t max_len = 1400)
 {
     std::uniform_int_distribution<size_t> len(1, max_len);

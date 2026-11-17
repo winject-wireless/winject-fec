@@ -8,8 +8,7 @@ Extracted from vstreamer `src/core/rs_block_erasure*`, `rs_encode_scalar*` and `
 at vstreamer commit `6089e8a`, with the same shard wire and parity math. Changes: the single
 TX+RX class is replaced by `block_encoder` / `block_decoder` (one block each, zero-copy push/pop)
 and `fec_write_stream` / `fec_read_stream`, which own the timing (parity spread, flush, give-up)
-on one reactor timer each; a k/n change applies from the next block; and the receiver delivers
-data as it arrives instead of in sequence.
+on one reactor timer each; and a k/n change applies from the next block.
 
 ## Wire
 
@@ -64,9 +63,9 @@ with a 16-byte aligned body.
   - Counters: shards by type, blocks, flushed blocks, and drops (`drop_no_headroom`,
     `drop_size`, `drop_parity_alloc`, `drop_output`).
 - `fec_read_stream`: `push(body, lc_type)` what the link received, `pop()` app datagrams.
-  - Plain datagrams and data shards go out the moment they arrive, so output is not in sequence
-    order.
-  - A lost data row is rebuilt from its block's parity and goes out as soon as it is.
+  - Plain datagrams go out at once. Data goes out in sequence: data behind a hole waits until the
+    hole is rebuilt from its block's parity or given up. Consumers such as an RTP depacketizer
+    drop a packet that comes after a later one, so a rebuilt row must not overtake.
   - The stream keeps a reference to recent data shards until their blocks can no longer need
     them: memory, not copies.
   - A hole is given up when its block's last parity is overdue. The sender's spread, and the
@@ -74,7 +73,7 @@ with a 16-byte aligned body.
     measured the wait is the 250 ms spread cap. Without parity (a data-only stream) a hole is
     given up as soon as later data shows the sender is past it.
   - Counters: recovered rows, rebuilt / given-up / failed / evicted blocks, missing data and
-    parity, late and duplicate shards, new sender sessions, header errors.
+    parity, late (not released) and duplicate shards, new sender sessions, header errors.
 - Both streams:
   - Threads: each runs on a `bfc::cv_reactor` (`attach(name)` looks it up in
     `bfc::cv_reactor_registry`), with one timer armed at its earliest deadline. Calls from other
