@@ -9,8 +9,10 @@ set(WINJECT_FEC_SOURCES
     ${WINJECT_FEC_ROOT}/src/wire.cpp
     ${WINJECT_FEC_ROOT}/src/rs_common.cpp
     ${WINJECT_FEC_ROOT}/src/rs_encode_scalar.cpp
-    ${WINJECT_FEC_ROOT}/src/encoder.cpp
-    ${WINJECT_FEC_ROOT}/src/decoder.cpp
+    ${WINJECT_FEC_ROOT}/src/block_encoder.cpp
+    ${WINJECT_FEC_ROOT}/src/block_decoder.cpp
+    ${WINJECT_FEC_ROOT}/src/write_stream.cpp
+    ${WINJECT_FEC_ROOT}/src/read_stream.cpp
 )
 
 # ISA-L and bfc are fetched after IDF's early requirement scan.
