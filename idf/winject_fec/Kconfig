@@ -15,6 +15,15 @@ config WINJECT_FEC_RS_PIE
         difference is about 0.1-0.3 fps. Turn it off where every encoder frame matters more
         than core 0 time.
 
+config WINJECT_FEC_TX_PSRAM
+    bool "FEC transmit: data row copies in PSRAM"
+    depends on SPIRAM
+    default y
+    help
+        Allocate the encoder's copies of a block's data rows (k rows of the largest datagram,
+        about 43 KiB at k=31 and 1400 bytes) in PSRAM, keeping internal RAM for the network and
+        USB drivers. The PIE kernel reads PSRAM directly.
+
 config WINJECT_FEC_RX_PSRAM
     bool "FEC receive: decode rows in PSRAM"
     depends on SPIRAM

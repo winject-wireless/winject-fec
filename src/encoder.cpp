@@ -61,16 +61,13 @@ bool encoder::configure(int k, int n, size_t max_datagram)
     active = true;
 
     /* Rows for the open block's data copies (parity only). */
-    rows_mem.reset();
-    rows_base = nullptr;
+    rows_mem = {};
     row_stride = 0;
     if (p > 0)
     {
         const size_t body_max = align_shard(max_original());
         row_stride = (body_max + k_body_align - 1) / k_body_align * k_body_align;
-        rows_mem.reset(new uint8_t[row_stride * static_cast<size_t>(cfg_k) + k_body_align - 1]);
-        const auto base = reinterpret_cast<uintptr_t>(rows_mem.get());
-        rows_base = rows_mem.get() + (k_body_align - base % k_body_align) % k_body_align;
+        rows_mem = detail::alloc_encode_rows(row_stride * static_cast<size_t>(cfg_k));
     }
     return true;
 }
@@ -85,8 +82,7 @@ void encoder::configure_bypass()
     cfg_n = 0;
     p = 0;
     full_g_tbls = nullptr;
-    rows_mem.reset();
-    rows_base = nullptr;
+    rows_mem = {};
     row_stride = 0;
 }
 
@@ -98,7 +94,7 @@ void encoder::set_tx_buffers(size_t headroom, shard_alloc alloc_fn)
 
 uint8_t* encoder::row(int i) const
 {
-    return rows_base + static_cast<size_t>(i) * row_stride;
+    return rows_mem.u8() + static_cast<size_t>(i) * row_stride;
 }
 
 encoder::state encoder::get_state() const

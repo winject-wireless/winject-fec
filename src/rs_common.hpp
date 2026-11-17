@@ -61,7 +61,11 @@ int gen_decode_matrix(int k, int total, const uint8_t* encode_matrix, const uint
 
 /* A 16-byte aligned decode row; in PSRAM where configured, to keep internal RAM for the
  * network and USB drivers. */
+/* len bytes, 16-byte aligned; in PSRAM when psram and the target has it (else the heap). */
+bfc::shared_sized_buffer alloc_aligned(size_t len, bool psram);
 bfc::shared_sized_buffer alloc_decode_row(size_t len);
+/* The encoder's row copies (CONFIG_WINJECT_FEC_TX_PSRAM: PSRAM). */
+bfc::shared_sized_buffer alloc_encode_rows(size_t len);
 
 void init_decode_tables(int k, int rows, uint8_t* matrix, uint8_t* g_tbls);
 

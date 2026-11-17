@@ -9,7 +9,8 @@
 #if defined(ESP_PLATFORM) && __has_include("sdkconfig.h")
 #include "sdkconfig.h"
 #endif
-#if defined(CONFIG_WINJECT_FEC_RX_PSRAM) && CONFIG_WINJECT_FEC_RX_PSRAM
+#if defined(ESP_PLATFORM) && defined(CONFIG_SPIRAM) && CONFIG_SPIRAM
+#define WINJECT_FEC_HAVE_PSRAM 1
 #include <new>
 
 #include "esp_heap_caps.h"
@@ -90,22 +91,45 @@ int gen_decode_matrix(int k, int total, const uint8_t* encode_matrix, const uint
     return 0;
 }
 
-bfc::shared_sized_buffer alloc_decode_row(size_t len)
+bfc::shared_sized_buffer alloc_aligned(size_t len, bool psram)
 {
-#if defined(CONFIG_WINJECT_FEC_RX_PSRAM) && CONFIG_WINJECT_FEC_RX_PSRAM
-    auto* bytes = static_cast<std::byte*>(
-        heap_caps_aligned_alloc(k_body_align, len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (bytes == nullptr)
+#ifdef WINJECT_FEC_HAVE_PSRAM
+    if (psram)
     {
-        throw std::bad_alloc();
+        auto* bytes = static_cast<std::byte*>(
+            heap_caps_aligned_alloc(k_body_align, len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (bytes == nullptr)
+        {
+            throw std::bad_alloc();
+        }
+        return bfc::shared_sized_buffer::adopt(bytes, len, len,
+                                               [](std::byte* p) { heap_caps_free(p); });
     }
-    return bfc::shared_sized_buffer::adopt(bytes, len, len, [](std::byte* p) { heap_caps_free(p); });
 #else
+    (void)psram;
+#endif
     auto storage = bfc::shared_sized_buffer::allocate(len + k_body_align - 1);
     storage.resize(len + k_body_align - 1);
     const size_t off =
         (k_body_align - reinterpret_cast<uintptr_t>(storage.u8()) % k_body_align) % k_body_align;
     return storage.subview(off, len);
+}
+
+bfc::shared_sized_buffer alloc_decode_row(size_t len)
+{
+#if defined(CONFIG_WINJECT_FEC_RX_PSRAM) && CONFIG_WINJECT_FEC_RX_PSRAM
+    return alloc_aligned(len, true);
+#else
+    return alloc_aligned(len, false);
+#endif
+}
+
+bfc::shared_sized_buffer alloc_encode_rows(size_t len)
+{
+#if defined(CONFIG_WINJECT_FEC_TX_PSRAM) && CONFIG_WINJECT_FEC_TX_PSRAM
+    return alloc_aligned(len, true);
+#else
+    return alloc_aligned(len, false);
 #endif
 }
 

@@ -199,10 +199,10 @@ private:
     /* Encode tables of a full block (k = cfg_k); short blocks look theirs up. */
     const uint8_t* full_g_tbls = nullptr;
 
-    /* The open block's data bodies: cfg_k rows of row_stride, 16-byte aligned. */
-    std::unique_ptr<uint8_t[]> rows_mem;
-    uint8_t*                   rows_base = nullptr;
-    size_t                     row_stride = 0;
+    /* The open block's data copies: cfg_k rows of row_stride, 16-byte aligned (PSRAM with
+     * CONFIG_WINJECT_FEC_TX_PSRAM). */
+    bfc::shared_sized_buffer rows_mem;
+    size_t                   row_stride = 0;
     size_t                     row_len[k_header_k_n_max] {};
     int                        open_rows = 0;
 

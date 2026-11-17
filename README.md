@@ -80,6 +80,7 @@ ESP-IDF: add `idf/winject_fec` to `EXTRA_COMPONENT_DIRS`. The project needs
 `CONFIG_COMPILER_CXX_EXCEPTIONS` (bfc throws). Kconfig:
 
 - `WINJECT_FEC_RS_PIE` (default y on the P4): PIE parity kernel, about 2.8x the table path.
+- `WINJECT_FEC_TX_PSRAM` (default y with PSRAM): the encoder's data row copies in PSRAM.
 - `WINJECT_FEC_RX_PSRAM`: decode rows and recovered payloads in PSRAM.
 
 `WINJECT_FEC_RX_DEADLINE_MARGIN_MIN_MS` (5..100, default 5) raises the decoder's deadline
