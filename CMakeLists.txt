@@ -21,8 +21,10 @@ add_library(winject_fec STATIC
     src/wire.cpp
     src/rs_common.cpp
     src/rs_encode_scalar.cpp
-    src/encoder.cpp
-    src/decoder.cpp
+    src/block_encoder.cpp
+    src/block_decoder.cpp
+    src/write_stream.cpp
+    src/read_stream.cpp
 )
 add_library(winject::fec ALIAS winject_fec)
 set_target_properties(winject_fec PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -34,7 +36,8 @@ target_include_directories(winject_fec
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(winject_fec PRIVATE winject_fec_isal)
+find_package(Threads REQUIRED)
+target_link_libraries(winject_fec PRIVATE winject_fec_isal PUBLIC Threads::Threads)
 target_compile_options(winject_fec PRIVATE -Wall -Wextra -Wpedantic)
 
 if(WINJECT_FEC_BUILD_TESTS)

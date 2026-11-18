@@ -1,10 +1,9 @@
-#include "winject_fec/encoder.hpp"
+#include "winject_fec/block_encoder.hpp"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
-#include <random>
 #include <utility>
 
 #include "rs_common.hpp"
@@ -19,19 +18,12 @@ using detail::k_min_shard;
 using detail::kn_encode_tables_for;
 using detail::store_be16;
 
-encoder::encoder()
-{
-    // Random start id: a restarted sender must not replay ids that the receiver's in-order
-    // release still remembers.
-    std::random_device rd;
-    tx_seq = static_cast<uint16_t>(rd());
-}
+block_encoder::block_encoder() = default;
+block_encoder::~block_encoder() = default;
+block_encoder::block_encoder(block_encoder&&) noexcept = default;
+block_encoder& block_encoder::operator=(block_encoder&&) noexcept = default;
 
-encoder::~encoder() = default;
-encoder::encoder(encoder&&) noexcept = default;
-encoder& encoder::operator=(encoder&&) noexcept = default;
-
-const char* encoder::impl_name() const
+const char* block_encoder::impl_name() const
 {
 #ifdef WINJECT_FEC_ISAL_NEON
     return "isa-l neon";
@@ -40,69 +32,58 @@ const char* encoder::impl_name() const
 #endif
 }
 
-bool encoder::configure(int k, int n, size_t max_datagram)
+bool block_encoder::valid(int k, int n, size_t max_datagram)
 {
-    if (k < k_header_k_n_min || k > k_header_k_n_max || n < k || n - k > k_header_k_n_max ||
-        max_datagram < k_parity_header_len + k_len_prefix + k_min_shard)
-    {
-        return false;
-    }
-    if (active && k == cfg_k && n == cfg_n && max_datagram == max_datagram_)
-    {
-        return true; /* nothing changes: the open block stays open */
-    }
-    /* Release the partial block under the parameters it was started with. */
-    flush();
-    cfg_k = k;
-    cfg_n = n;
-    p = n - k;
-    max_datagram_ = max_datagram;
-    full_g_tbls = kn_encode_tables_for(cfg_k, cfg_n).g_tbls.data();
-    active = true;
-
-    /* Rows for the open block's data copies (parity only). */
-    rows_mem = {};
-    row_stride = 0;
-    if (p > 0)
-    {
-        const size_t body_max = align_shard(max_original());
-        row_stride = (body_max + k_body_align - 1) / k_body_align * k_body_align;
-        rows_mem = detail::alloc_encode_rows(row_stride * static_cast<size_t>(cfg_k));
-    }
-    return true;
+    return k >= k_header_k_n_min && k <= k_header_k_n_max && n >= k &&
+           n - k <= k_header_k_n_max &&
+           max_datagram >= k_parity_header_len + k_len_prefix + k_min_shard;
 }
 
-void encoder::configure_bypass()
-{
-    flush();
-    active = false;
-    open_rows = 0;
-    max_datagram_ = 0;
-    cfg_k = 0;
-    cfg_n = 0;
-    p = 0;
-    full_g_tbls = nullptr;
-    rows_mem = {};
-    row_stride = 0;
-}
-
-void encoder::set_tx_buffers(size_t headroom, shard_alloc alloc_fn)
+void block_encoder::set_tx_buffers(size_t headroom, shard_alloc alloc_fn)
 {
     tx_headroom = headroom;
     tx_alloc = std::move(alloc_fn);
 }
 
-uint8_t* encoder::row(int i) const
+uint8_t* block_encoder::row(int i) const
 {
     return rows_mem.u8() + static_cast<size_t>(i) * row_stride;
 }
 
-encoder::state encoder::get_state() const
+bool block_encoder::start(uint16_t base, int k, int n, size_t max_datagram, time_point now)
+{
+    if (open || !queue.empty() || !valid(k, n, max_datagram))
+    {
+        return false;
+    }
+    cfg_k = k;
+    cfg_n = n;
+    p = n - k;
+    max_datagram_ = max_datagram;
+    block_base = base;
+    block_start_ = now;
+    open_rows = 0;
+    open = true;
+    if (p > 0)
+    {
+        const size_t body_max = align_shard(max_original(max_datagram_));
+        const size_t stride = (body_max + k_body_align - 1) / k_body_align * k_body_align;
+        const size_t need = stride * static_cast<size_t>(cfg_k);
+        if (rows_mem.empty() || rows_mem.size() < need)
+        {
+            rows_mem = detail::alloc_encode_rows(need);
+        }
+        row_stride = stride;
+    }
+    return true;
+}
+
+block_encoder::state block_encoder::get_state() const
 {
     return queue.empty() ? state {} : queue.front().st;
 }
 
-bfc::shared_sized_buffer encoder::pop()
+bfc::shared_sized_buffer block_encoder::pop()
 {
     if (queue.empty())
     {
@@ -113,15 +94,18 @@ bfc::shared_sized_buffer encoder::pop()
     return buf;
 }
 
-void encoder::push(bfc::shared_sized_buffer datagram)
+void block_encoder::push(bfc::shared_sized_buffer datagram, time_point now)
 {
+    if (!open)
+    {
+        drop_not_open_++;
+        return;
+    }
     if (!queue.empty())
     {
         drop_queued_++;
         return;
     }
-    /* [tx_headroom][fec header slot][payload]: the caller reserved the slot in every mode, so
-     * where the payload starts does not depend on whether FEC is on. */
     const size_t reserve = push_offset();
     if (datagram.size() < reserve)
     {
@@ -129,54 +113,44 @@ void encoder::push(bfc::shared_sized_buffer datagram)
         return;
     }
     const size_t len = datagram.size() - reserve;
-    if (0 == len || len > max_original())
+    if (0 == len || len > max_original(max_datagram_))
     {
         drop_size_++;
         return;
     }
-    if (!active)
-    {
-        /* Plain: the same buffer, the unused header slot cut off the front. */
-        state st;
-        st.type = shard_type::plain;
-        queue.push_back({datagram.subview(k_data_header_len, datagram.size() - k_data_header_len),
-                         st});
-        return;
-    }
     uint8_t* const hdr = datagram.u8() + tx_headroom;
-    write_data_header(hdr, tx_seq);
+    write_data_header(hdr, static_cast<uint16_t>(block_base + open_rows));
     if (p > 0)
     {
-        if (0 == open_rows)
-        {
-            block_base = tx_seq;
-            block_start_ = clock ? clock() : std::chrono::steady_clock::now();
-        }
         memcpy(row(open_rows), hdr + k_data_header_len, len);
         row_len[open_rows] = len;
-        open_rows++;
     }
-    tx_seq++;
+    open_rows++;
     state st;
     st.type = shard_type::data;
     queue.push_back({std::move(datagram), st});
-    if (p > 0 && open_rows >= cfg_k)
+    if (open_rows >= cfg_k)
     {
-        (void)encode_block();
+        encode_block(now);
     }
 }
 
-void encoder::flush()
+void block_encoder::close(time_point now)
 {
-    if (!active || 0 == open_rows)
+    if (!open)
     {
         return;
     }
-    (void)encode_block();
+    if (0 == open_rows)
+    {
+        open = false; /* nothing pushed: no block on the wire */
+        return;
+    }
+    encode_block(now);
 }
 
 /* A parity buffer: tx_headroom, then header + length prefix, then a 16-byte aligned body. */
-bfc::shared_sized_buffer encoder::alloc_parity(size_t body_len)
+bfc::shared_sized_buffer block_encoder::alloc_parity(size_t body_len)
 {
     const size_t             hdr = k_parity_header_len + k_len_prefix;
     const size_t             cap = k_body_align - 1 + tx_headroom + hdr + body_len;
@@ -200,23 +174,27 @@ bfc::shared_sized_buffer encoder::alloc_parity(size_t body_len)
     return buf.subview(pad, tx_headroom + hdr + body_len);
 }
 
-/* Parity over the open rows, queued in row order. Two kernel passes: the data bodies (zero padded
- * to the longest) and the 2-byte length rows; parity is [length parity | data parity]. */
-bool encoder::encode_block()
+/* Closes the block: parity over the rows, queued in row order. Two kernel passes: the data bodies
+ * (zero padded to the longest) and the 2-byte length rows; parity is [length parity | data
+ * parity]. */
+void block_encoder::encode_block(time_point now)
 {
+    open = false;
     const int k_total = open_rows;
     open_rows = 0;
+    if (0 == p)
+    {
+        return; /* data only */
+    }
     size_t max_len = 0;
     for (int i = 0; i < k_total; i++)
     {
         max_len = std::max(max_len, row_len[i]);
     }
     const size_t shard_len = align_shard(max_len);
-    /* The cache never moves an entry, so the full block's tables can be kept from configure(). */
-    unsigned char* const g_tbls = const_cast<unsigned char*>(
-        k_total == cfg_k && nullptr != full_g_tbls
-            ? full_g_tbls
-            : kn_encode_tables_for(k_total, k_total + p).g_tbls.data());
+    /* The cache never moves an entry, so the reference stays valid. */
+    unsigned char* const g_tbls =
+        const_cast<unsigned char*>(kn_encode_tables_for(k_total, k_total + p).g_tbls.data());
 
     alignas(16) uint8_t len_rows[k_max_k][k_min_shard] {};
     alignas(16) uint8_t len_parity[k_max_k][k_min_shard] {};
@@ -239,7 +217,7 @@ bool encoder::encode_block()
         if (parity[static_cast<size_t>(j)].empty())
         {
             drop_parity_alloc_++;
-            return false;
+            return;
         }
         coding_ptrs[static_cast<size_t>(j)] =
             parity[static_cast<size_t>(j)].u8() + tx_headroom + k_parity_header_len + k_len_prefix;
@@ -263,14 +241,14 @@ bool encoder::encode_block()
         memcpy(hdr + k_parity_header_len, len_parity[j], k_len_prefix);
         state st;
         st.type = shard_type::parity;
-        st.parity_index = j;
-        st.parity_count = p;
-        st.block_k = k_total;
-        st.block_start = block_start_;
+        st.parity.index = j;
+        st.parity.count = p;
+        st.parity.block_k = k_total;
+        st.parity.block_start = block_start_;
+        st.parity.block_close = now;
         queue.push_back({std::move(buf), st});
     }
     blocks_count++;
-    return true;
 }
 
 }  // namespace winject::fec

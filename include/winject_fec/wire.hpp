@@ -35,6 +35,14 @@ inline constexpr int      k_header_k_n_max = 31;
 /* Longest parity spread a sender may use; the receiver assumes it until it has measured one. */
 inline constexpr int k_spread_cap_ms = 250;
 
+/* LC body type in front of every FEC stream datagram: plain carries the payload as is, fec a
+ * shard of this wire. */
+enum class lc_type : uint8_t
+{
+    plain = 0,
+    fec = 1,
+};
+
 struct shard_header
 {
     bool     is_data = false;

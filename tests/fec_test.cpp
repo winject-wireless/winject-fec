@@ -1,156 +1,18 @@
-#include "winject_fec/decoder.hpp"
-#include "winject_fec/encoder.hpp"
-#include "winject_fec/wire.hpp"
+/* Wire, block_encoder, block_decoder and fec_read_stream. */
+#include "test_util.hpp"
 
-#include <gtest/gtest.h>
+#include "winject_fec/block_decoder.hpp"
 
-#include <algorithm>
-#include <chrono>
-#include <cstdint>
-#include <cstring>
-#include <random>
-#include <vector>
-
-using namespace winject::fec;
+using namespace fec_test;
 
 namespace
 {
 
-constexpr size_t k_datagram = 1476;
+using clk = std::chrono::steady_clock;
 
-using bytes = std::vector<uint8_t>;
-
-struct shard
+block_encoder::state st(const block_encoder& e)
 {
-    bytes data;
-    bool  parity = false;
-};
-
-/* App datagram i: its index in the first four bytes, then a pattern. */
-bytes make_app(uint32_t i, size_t len)
-{
-    bytes b(std::max<size_t>(len, 4));
-    std::memcpy(b.data(), &i, 4);
-    for (size_t j = 4; j < b.size(); j++)
-    {
-        b[j] = static_cast<uint8_t>(i * 31 + j);
-    }
-    return b;
-}
-
-/* The datagram as a receive path leaves it: room bytes free in front, then the data. */
-bfc::shared_sized_buffer to_buf(const bytes &b, size_t room)
-{
-    auto buf = bfc::shared_sized_buffer::allocate(room + b.size());
-    buf.resize(room + b.size());
-    std::copy(b.begin(), b.end(), buf.u8() + room);
-    return buf;
-}
-
-/* Pops everything queued, in FIFO order. */
-std::vector<shard> drain(encoder &enc)
-{
-    std::vector<shard> v;
-    while (enc.get_state().type != encoder::shard_type::none)
-    {
-        const bool parity = enc.get_state().type == encoder::shard_type::parity;
-        const auto b = enc.pop();
-        v.push_back({bytes(b.u8(), b.u8() + b.size()), parity});
-    }
-    return v;
-}
-
-bfc::shared_sized_buffer to_buf(const encoder &enc, const bytes &b)
-{
-    return to_buf(b, enc.push_offset());
-}
-
-std::vector<shard> push(encoder &enc, const bytes &app)
-{
-    enc.push(to_buf(enc, app));
-    return drain(enc);
-}
-
-std::vector<shard> flush(encoder &enc)
-{
-    enc.flush();
-    return drain(enc);
-}
-
-/* Encodes apps[0..count) and returns every shard in send order (data at once, parity after). */
-std::vector<shard> encode_all(encoder &enc, const std::vector<bytes> &apps)
-{
-    std::vector<shard> all;
-    for (const auto &a : apps)
-    {
-        auto s = push(enc, a);
-        all.insert(all.end(), s.begin(), s.end());
-    }
-    return all;
-}
-
-std::vector<bytes> make_apps(size_t count, std::mt19937 *rng, size_t max_len = 1400)
-{
-    std::uniform_int_distribution<size_t> len(1, max_len);
-    std::vector<bytes>                    apps;
-    for (size_t i = 0; i < count; i++)
-    {
-        apps.push_back(make_app(static_cast<uint32_t>(i), len(*rng)));
-    }
-    return apps;
-}
-
-struct receiver
-{
-    decoder            dec;
-    std::vector<bytes> got;
-    void               take(payload_list &out)
-    {
-        for (const auto &p : out)
-        {
-            got.emplace_back(p.u8(), p.u8() + p.size());
-        }
-    }
-    void push(const bytes &b)
-    {
-        payload_list out;
-        dec.push_air(b.data(), b.size(), &out);
-        take(out);
-    }
-    void poll()
-    {
-        payload_list out;
-        dec.poll_rx(&out);
-        take(out);
-    }
-};
-
-/* Drives an encoder or decoder clock: deadlines are tested by advancing it, not by sleeping. */
-struct fake_clock
-{
-    std::chrono::steady_clock::time_point t =
-        std::chrono::steady_clock::time_point {} + std::chrono::hours(1);
-    template <typename T>
-    void attach(T &dec)
-    {
-        dec.set_clock([this] { return t; });
-    }
-    void advance(int ms)
-    {
-        t += std::chrono::milliseconds(ms);
-    }
-    void advance_us(int64_t us)
-    {
-        t += std::chrono::microseconds(us);
-    }
-};
-
-encoder make_enc(int k, int n, uint16_t seq = 100)
-{
-    encoder enc;
-    EXPECT_TRUE(enc.configure(k, n, k_datagram));
-    enc.set_tx_sequence(seq);
-    return enc;
+    return e.get_state();
 }
 
 }  // namespace
@@ -182,7 +44,7 @@ TEST(FecWire, HeaderRoundTrip)
 
 TEST(FecWire, HeaderRejectsInvalid)
 {
-    shard_header h;
+    shard_header  h;
     const uint8_t spare[] = {0x81, 0, 0, 1};
     EXPECT_FALSE(parse_header(spare, sizeof(spare), &h));
     const uint8_t data_no_body[] = {0x80, 0, 0};
@@ -197,12 +59,14 @@ TEST(FecWire, HeaderRejectsInvalid)
     EXPECT_FALSE(parse_header(bad_row, sizeof(bad_row), &h));
 }
 
-TEST(FecEncoder, DataLeavesAtOnceParityAtClose)
+/* --- block_encoder --- */
+
+TEST(FecBlockEncoder, DataLeavesAtOnceParityAtClose)
 {
-    auto enc = make_enc(6, 8, 500);
+    sender tx(6, 8, 500);
     for (int i = 0; i < 5; i++)
     {
-        auto s = push(enc, make_app(static_cast<uint32_t>(i), 100));
+        auto s = tx.push(make_app(static_cast<uint32_t>(i), 100));
         ASSERT_EQ(s.size(), 1u);
         shard_header h;
         ASSERT_TRUE(parse_header(s[0].data.data(), s[0].data.size(), &h));
@@ -210,14 +74,15 @@ TEST(FecEncoder, DataLeavesAtOnceParityAtClose)
         EXPECT_EQ(h.sequence_number, 500 + i);
         EXPECT_EQ(s[0].data.size(), 3u + 100u);
     }
-    auto s = push(enc, make_app(5, 40));
+    EXPECT_TRUE(tx.enc.is_open());
+    auto s = tx.push(make_app(5, 40));
+    EXPECT_FALSE(tx.enc.is_open());
     ASSERT_EQ(s.size(), 3u);
     EXPECT_FALSE(s[0].parity);
     for (int j = 0; j < 2; j++)
     {
         shard_header h;
-        ASSERT_TRUE(parse_header(s[1 + j].data.data(), s[1 + j].data.size(),
-                                                   &h));
+        ASSERT_TRUE(parse_header(s[1 + j].data.data(), s[1 + j].data.size(), &h));
         EXPECT_FALSE(h.is_data);
         EXPECT_EQ(h.sequence_number, 500);
         EXPECT_EQ(h.k_total, 6);
@@ -227,99 +92,72 @@ TEST(FecEncoder, DataLeavesAtOnceParityAtClose)
         EXPECT_EQ(s[1 + j].data.size(), 4u + 2u + 100u);
     }
     /* Next block starts right after. */
-    auto next = push(enc, make_app(6, 10));
+    auto         next = tx.push(make_app(6, 10));
     shard_header h;
     ASSERT_TRUE(parse_header(next[0].data.data(), next[0].data.size(), &h));
     EXPECT_EQ(h.sequence_number, 506);
 }
 
-TEST(FecEncoder, SizeLimits)
+TEST(FecBlockEncoder, SizeLimits)
 {
-    auto enc = make_enc(2, 3);
-    EXPECT_EQ(enc.max_original(), k_datagram - 6);
+    sender tx(2, 3);
+    EXPECT_EQ(block_encoder::max_original(k_datagram), k_datagram - 6);
     EXPECT_EQ(max_data_payload(k_datagram), k_datagram - 3);
-    EXPECT_TRUE(push(enc, make_app(0, k_datagram - 5)).empty());
-    EXPECT_EQ(enc.drop_size(), 1u);
-    EXPECT_TRUE(push(enc, bytes {}).empty());
-    EXPECT_EQ(enc.drop_size(), 2u);
-    auto a = push(enc, make_app(1, k_datagram - 6));
-    auto b = push(enc, make_app(2, 1));
+    EXPECT_TRUE(tx.push(make_app(0, k_datagram - 5)).empty());
+    EXPECT_EQ(tx.enc.drop_size(), 1u);
+    EXPECT_TRUE(tx.push(bytes {}).empty());
+    EXPECT_EQ(tx.enc.drop_size(), 2u);
+    auto a = tx.push(make_app(1, k_datagram - 6));
+    auto b = tx.push(make_app(2, 1));
     ASSERT_EQ(b.size(), 2u);
     EXPECT_EQ(a[0].data.size(), k_datagram - 3);
     EXPECT_EQ(b[1].data.size(), k_datagram);
 }
 
-TEST(FecEncoder, ConfigureRejectsInvalid)
+TEST(FecBlockEncoder, ValidRejectsInvalid)
 {
-    encoder enc;
-    EXPECT_FALSE(enc.configure(0, 2, k_datagram));
-    EXPECT_FALSE(enc.configure(32, 32, k_datagram));
-    EXPECT_FALSE(enc.configure(4, 3, k_datagram));
-    EXPECT_FALSE(enc.configure(4, 6, 10));
-    EXPECT_FALSE(enc.fec());
-    EXPECT_TRUE(enc.configure(1, 1, k_datagram));
-    EXPECT_TRUE(enc.configure(31, 31, k_datagram));
+    EXPECT_FALSE(block_encoder::valid(0, 2, k_datagram));
+    EXPECT_FALSE(block_encoder::valid(32, 32, k_datagram));
+    EXPECT_FALSE(block_encoder::valid(4, 3, k_datagram));
+    EXPECT_FALSE(block_encoder::valid(4, 6, 10));
+    EXPECT_FALSE(block_encoder::valid(1, 33, k_datagram));
+    EXPECT_TRUE(block_encoder::valid(1, 1, k_datagram));
+    EXPECT_TRUE(block_encoder::valid(31, 31, k_datagram));
+    EXPECT_TRUE(block_encoder::valid(31, 62, k_datagram));
+    block_encoder enc;
+    EXPECT_FALSE(enc.start(0, 4, 3, k_datagram, clk::now()));
+    EXPECT_FALSE(enc.is_open());
 }
 
-TEST(FecEncoder, DefaultIsBypass)
+TEST(FecBlockEncoder, StateWalksDataThenParity)
 {
-    encoder enc;
-    EXPECT_FALSE(enc.fec());
-    EXPECT_EQ(enc.get_state().type, encoder::shard_type::none);
-    EXPECT_EQ(enc.pop().size(), 0u);
-    const uint16_t seq = enc.tx_sequence();
-    EXPECT_EQ(enc.push_offset(), 3u); /* the fec slot is reserved in bypass too */
-    const bytes app = make_app(1, 2000); /* no FEC size limit in bypass */
-    const auto  in = to_buf(enc, app);
-    enc.push(in);
-    ASSERT_EQ(enc.queued(), 1u);
-    EXPECT_EQ(enc.get_state().type, encoder::shard_type::plain);
-    const auto b = enc.pop();
-    /* The pushed buffer with the slot cut off: the data, untouched. */
-    EXPECT_EQ(b.get_storage(), in.get_storage());
-    EXPECT_EQ(b.u8(), in.u8() + 3);
-    EXPECT_EQ(bytes(b.u8(), b.u8() + b.size()), app);
-    EXPECT_EQ(enc.get_state().type, encoder::shard_type::none);
-    EXPECT_EQ(enc.tx_sequence(), seq); /* plain datagrams take no FEC sequence */
-
-    ASSERT_TRUE(enc.configure(2, 3, k_datagram));
-    EXPECT_EQ(enc.queued(), 0u);
-    enc.push(to_buf(enc, make_app(2, 50)));
-    EXPECT_EQ(enc.get_state().type, encoder::shard_type::data);
-    const auto d = enc.pop();
-    shard_header h;
-    ASSERT_TRUE(parse_header(d.u8(), d.size(), &h));
-    EXPECT_TRUE(h.is_data);
-    EXPECT_EQ(h.sequence_number, seq);
-}
-
-TEST(FecEncoder, StateWalksDataThenParity)
-{
-    auto      enc = make_enc(3, 5, 40);
-    fake_clock clk;
-    enc.set_clock([&clk] { return clk.t; });
-    const auto t0 = clk.t;
+    block_encoder enc;
+    const auto    t0 = clk::time_point {} + std::chrono::hours(1);
+    ASSERT_TRUE(enc.start(40, 3, 5, k_datagram, t0));
+    EXPECT_EQ(enc.block_start(), t0);
     for (uint32_t i = 0; i < 2; i++)
     {
-        enc.push(to_buf(enc, make_app(i, 30)));
-        clk.advance(3);
-        ASSERT_EQ(enc.get_state().type, encoder::shard_type::data);
+        enc.push(to_buf(make_app(i, 30), enc.push_offset()), t0);
+        ASSERT_EQ(st(enc).type, shard_type::data);
         (void)enc.pop();
-        EXPECT_EQ(enc.get_state().type, encoder::shard_type::none);
+        EXPECT_EQ(st(enc).type, shard_type::none);
     }
+    EXPECT_EQ(enc.rows(), 2);
     /* The closing push queues its data shard, then the parity. */
-    enc.push(to_buf(enc, make_app(2, 30)));
+    const auto t1 = t0 + std::chrono::milliseconds(7);
+    enc.push(to_buf(make_app(2, 30), enc.push_offset()), t1);
     ASSERT_EQ(enc.queued(), 3u);
-    EXPECT_EQ(enc.get_state().type, encoder::shard_type::data);
+    EXPECT_EQ(st(enc).type, shard_type::data);
     (void)enc.pop();
     for (int j = 0; j < 2; j++)
     {
-        const auto st = enc.get_state();
-        ASSERT_EQ(st.type, encoder::shard_type::parity);
-        EXPECT_EQ(st.parity_index, j);
-        EXPECT_EQ(st.parity_count, 2);
-        EXPECT_EQ(st.block_k, 3);
-        EXPECT_EQ(st.block_start, t0);
+        const auto s = st(enc);
+        ASSERT_EQ(s.type, shard_type::parity);
+        EXPECT_EQ(s.parity.index, j);
+        EXPECT_EQ(s.parity.count, 2);
+        EXPECT_EQ(s.parity.block_k, 3);
+        EXPECT_EQ(s.parity.block_start, t0);
+        EXPECT_EQ(s.parity.block_close, t1);
         shard_header h;
         const auto   b = enc.pop();
         ASSERT_TRUE(parse_header(b.u8(), b.size(), &h));
@@ -327,73 +165,54 @@ TEST(FecEncoder, StateWalksDataThenParity)
         EXPECT_EQ(h.k_i, j);
         EXPECT_EQ(h.sequence_number, 40);
     }
-    EXPECT_EQ(enc.get_state().type, encoder::shard_type::none);
+    EXPECT_EQ(st(enc).type, shard_type::none);
+    EXPECT_EQ(enc.blocks(), 1u);
 }
 
-TEST(FecEncoder, ConfigureMidBlockReleasesPartialBlock)
+TEST(FecBlockEncoder, ShortCloseThenNextBlock)
 {
-    auto enc = make_enc(6, 8, 300);
+    sender tx(6, 9, 300);
     for (uint32_t i = 0; i < 4; i++)
     {
-        ASSERT_EQ(push(enc, make_app(i, 60)).size(), 1u);
+        ASSERT_EQ(tx.push(make_app(i, 60)).size(), 1u);
     }
-    /* Same parameters: nothing to release, the block stays open. */
-    ASSERT_TRUE(enc.configure(6, 8, k_datagram));
-    EXPECT_EQ(enc.queued(), 0u);
-
-    /* New k/n mid-block: the 4 open rows close under the old n - k = 2. */
-    ASSERT_TRUE(enc.configure(3, 6, k_datagram));
-    ASSERT_EQ(enc.queued(), 2u);
-    for (int j = 0; j < 2; j++)
-    {
-        const auto st = enc.get_state();
-        ASSERT_EQ(st.type, encoder::shard_type::parity);
-        EXPECT_EQ(st.parity_count, 2);
-        EXPECT_EQ(st.block_k, 4);
-        const auto   b = enc.pop();
-        shard_header h;
-        ASSERT_TRUE(parse_header(b.u8(), b.size(), &h));
-        EXPECT_FALSE(h.is_data);
-        EXPECT_EQ(h.sequence_number, 300);
-        EXPECT_EQ(h.k_total, 4);
-        EXPECT_EQ(h.n, 2);
-    }
-    EXPECT_EQ(enc.blocks(), 1u);
-
-    /* The next block runs under k = 3, n - k = 3 and continues the sequence. */
-    push(enc, make_app(4, 60));
-    push(enc, make_app(5, 60));
-    auto s = push(enc, make_app(6, 60));
-    ASSERT_EQ(s.size(), 4u);
+    auto parity = tx.flush();
+    ASSERT_EQ(parity.size(), 3u);
     shard_header h;
+    ASSERT_TRUE(parse_header(parity[0].data.data(), parity[0].data.size(), &h));
+    EXPECT_EQ(h.sequence_number, 300);
+    EXPECT_EQ(h.k_total, 4);
+    EXPECT_EQ(h.n, 3);
+    /* A closed block with nothing pushed is no block. */
+    EXPECT_TRUE(tx.flush().empty());
+    ASSERT_TRUE(tx.enc.start(tx.seq, 2, 3, k_datagram, clk::now()));
+    tx.enc.close(clk::now());
+    EXPECT_FALSE(tx.enc.is_open());
+    EXPECT_EQ(tx.enc.queued(), 0u);
+    EXPECT_EQ(tx.enc.blocks(), 1u);
+    /* The next block reuses the rows and continues the sequence. */
+    tx.configure(2, 4);
+    tx.push(make_app(4, 60));
+    auto s = tx.push(make_app(5, 60));
+    ASSERT_EQ(s.size(), 3u);
     ASSERT_TRUE(parse_header(s[1].data.data(), s[1].data.size(), &h));
     EXPECT_EQ(h.sequence_number, 304);
-    EXPECT_EQ(h.k_total, 3);
-    EXPECT_EQ(h.n, 3);
-
-    /* Back to bypass releases the open block too. */
-    push(enc, make_app(7, 60));
-    enc.configure_bypass();
-    EXPECT_FALSE(enc.fec());
-    ASSERT_EQ(enc.queued(), 3u);
-    EXPECT_EQ(enc.get_state().block_k, 1);
-    EXPECT_EQ(enc.blocks(), 3u);
-    drain(enc);
-    enc.push(to_buf(enc, make_app(8, 60)));
-    EXPECT_EQ(enc.get_state().type, encoder::shard_type::plain);
+    EXPECT_EQ(h.k_total, 2);
+    EXPECT_EQ(h.n, 2);
 }
 
-TEST(FecEncoder, DataShardIsThePushedBuffer)
+TEST(FecBlockEncoder, DataShardIsThePushedBuffer)
 {
-    auto enc = make_enc(3, 5, 70);
+    block_encoder enc;
     enc.set_tx_buffers(7, nullptr);
     EXPECT_EQ(enc.push_offset(), 10u);
+    ASSERT_TRUE(enc.start(70, 3, 5, k_datagram, clk::now()));
     for (uint32_t i = 0; i < 3; i++)
     {
         const bytes app = make_app(i, 50 + i);
-        const auto  in = to_buf(enc, app);
-        enc.push(in);
-        ASSERT_EQ(enc.get_state().type, encoder::shard_type::data);
+        const auto  in = to_buf(app, enc.push_offset());
+        enc.push(in, clk::now());
+        ASSERT_EQ(st(enc).type, shard_type::data);
         const auto d = enc.pop();
         /* The same buffer: header in the slot, 7 bytes in front for the next layers. */
         EXPECT_EQ(d.u8(), in.u8());
@@ -406,59 +225,69 @@ TEST(FecEncoder, DataShardIsThePushedBuffer)
     EXPECT_EQ(enc.queued(), 2u);
 }
 
-TEST(FecEncoder, PushDropsAndCounts)
+TEST(FecBlockEncoder, PushDropsAndCounts)
 {
-    auto enc = make_enc(2, 4);
+    block_encoder enc;
     enc.set_tx_buffers(4, nullptr);
+    const auto t = clk::now();
+    enc.push(to_buf(make_app(0, 40), enc.push_offset()), t);
+    EXPECT_EQ(enc.drop_not_open(), 1u);
+    ASSERT_TRUE(enc.start(0, 2, 4, k_datagram, t));
     /* Shorter than headroom + slot. */
-    enc.push(to_buf(bytes(6, 0), 0));
+    enc.push(to_buf(bytes(6, 0), 0), t);
     EXPECT_EQ(enc.drop_no_headroom(), 1u);
     /* Headroom + slot but no data. */
-    enc.push(to_buf(bytes(7, 0), 0));
+    enc.push(to_buf(bytes(7, 0), 0), t);
     EXPECT_EQ(enc.drop_size(), 1u);
     EXPECT_EQ(enc.queued(), 0u);
-    EXPECT_EQ(enc.tx_sequence(), 100u); /* a dropped datagram takes no sequence */
+    EXPECT_EQ(enc.rows(), 0); /* a dropped datagram takes no row */
 
-    /* Shards still queued: the push is refused, nothing queued behind them. */
-    enc.push(to_buf(enc, make_app(1, 40)));
-    enc.push(to_buf(enc, make_app(2, 40)));
+    /* Shards still queued: the push is refused. */
+    enc.push(to_buf(make_app(1, 40), enc.push_offset()), t);
+    enc.push(to_buf(make_app(2, 40), enc.push_offset()), t);
     EXPECT_EQ(enc.drop_queued(), 1u);
     EXPECT_EQ(enc.queued(), 1u);
+    /* ... and so is a new block while they are. */
     (void)enc.pop();
-    enc.push(to_buf(enc, make_app(2, 40)));
+    enc.push(to_buf(make_app(2, 40), enc.push_offset()), t);
     EXPECT_EQ(enc.queued(), 3u); /* data + 2 parity */
-    (void)enc.pop();
-    enc.push(to_buf(enc, make_app(3, 40))); /* parity still queued */
-    EXPECT_EQ(enc.drop_queued(), 2u);
-    EXPECT_EQ(enc.get_state().type, encoder::shard_type::parity);
+    EXPECT_FALSE(enc.start(2, 2, 4, k_datagram, t));
+    while (enc.queued() > 0)
+    {
+        (void)enc.pop();
+    }
 
     /* Parity buffers that cannot be allocated lose the block's parity, counted. */
-    drain(enc);
     enc.set_tx_buffers(4, [](size_t) { return bfc::shared_sized_buffer {}; });
-    enc.push(to_buf(enc, make_app(4, 40)));
-    drain(enc);
-    enc.push(to_buf(enc, make_app(5, 40)));
-    EXPECT_EQ(drain(enc).size(), 1u);
+    ASSERT_TRUE(enc.start(2, 2, 4, k_datagram, t));
+    enc.push(to_buf(make_app(4, 40), enc.push_offset()), t);
+    (void)enc.pop();
+    enc.push(to_buf(make_app(5, 40), enc.push_offset()), t);
+    EXPECT_EQ(enc.queued(), 1u);
     EXPECT_EQ(enc.drop_parity_alloc(), 1u);
+    EXPECT_FALSE(enc.is_open());
 }
 
-TEST(FecEncoder, ParityHasHeadroomAndAlignedBody)
+TEST(FecBlockEncoder, ParityHasHeadroomAndAlignedBody)
 {
-    auto enc = make_enc(3, 5);
-    enc.set_tx_buffers(8, [](size_t cap) {
-        auto b = bfc::shared_sized_buffer::allocate(cap + 64);
-        b.resize(cap + 64);
-        return b;
-    });
+    block_encoder enc;
+    enc.set_tx_buffers(8,
+                       [](size_t cap)
+                       {
+                           auto b = bfc::shared_sized_buffer::allocate(cap + 64);
+                           b.resize(cap + 64);
+                           return b;
+                       });
+    ASSERT_TRUE(enc.start(0, 3, 5, k_datagram, clk::now()));
     for (uint32_t i = 0; i < 3; i++)
     {
-        enc.push(to_buf(enc, make_app(i, 50 + i)));
+        enc.push(to_buf(make_app(i, 50 + i), enc.push_offset()), clk::now());
         (void)enc.pop();
     }
     ASSERT_EQ(enc.queued(), 2u);
-    while (enc.get_state().type == encoder::shard_type::parity)
+    while (st(enc).type == shard_type::parity)
     {
-        const auto   b = enc.pop();
+        const auto b = enc.pop();
         /* [8 headroom][4 header][2 length parity][body], body 16-byte aligned. */
         EXPECT_EQ(b.size(), 8u + 4u + 2u + 52u);
         EXPECT_EQ(reinterpret_cast<uintptr_t>(b.u8() + 8 + 4 + 2) % 16, 0u);
@@ -468,35 +297,84 @@ TEST(FecEncoder, ParityHasHeadroomAndAlignedBody)
     }
 }
 
-TEST(FecDecoder, LosslessInOrder)
+/* --- block_decoder --- */
+
+TEST(FecBlockDecoder, RebuildsFromViewsAndPopsInRowOrder)
+{
+    std::mt19937 rng(21);
+    sender       tx(5, 8, 900);
+    auto         apps = make_apps(5, &rng);
+    auto         all = tx.encode_all(apps); /* d0..d4 p0 p1 p2 */
+    ASSERT_EQ(all.size(), 8u);
+    block_decoder dec;
+    dec.start(900, 5, 3);
+    const auto view = [](const bytes& b, size_t skip)
+    { return bfc::shared_sized_buffer::copy_from(b.data() + skip, b.size() - skip); };
+    EXPECT_TRUE(dec.push_data(0, view(all[0].data, 3)));
+    EXPECT_FALSE(dec.push_data(0, view(all[0].data, 3)));
+    EXPECT_TRUE(dec.push_data(3, view(all[3].data, 3)));
+    EXPECT_TRUE(dec.push_parity(2, view(all[7].data, 4)));
+    EXPECT_FALSE(dec.decodable());
+    EXPECT_TRUE(dec.push_parity(0, view(all[5].data, 4)));
+    EXPECT_FALSE(dec.decodable());
+    EXPECT_TRUE(dec.push_parity(1, view(all[6].data, 4)));
+    ASSERT_TRUE(dec.decodable());
+    ASSERT_TRUE(dec.decode());
+    EXPECT_EQ(dec.data_count(), 0); /* rows dropped after the rebuild */
+    for (int row : {1, 2, 4})
+    {
+        const auto s = dec.get_state();
+        ASSERT_TRUE(s.ready);
+        EXPECT_EQ(s.row, row);
+        EXPECT_EQ(s.seq, 900 + row);
+        const auto b = dec.pop();
+        EXPECT_EQ(bytes(b.u8(), b.u8() + b.size()), apps[static_cast<size_t>(row)]);
+    }
+    EXPECT_FALSE(dec.get_state().ready);
+    dec.reset();
+    EXPECT_FALSE(dec.started());
+}
+
+/* --- fec_read_stream --- */
+
+TEST(FecReadStream, PlainPassesThrough)
+{
+    receiver rx;
+    rx.push(make_app(7, 30), lc_type::plain);
+    ASSERT_EQ(rx.got.size(), 1u);
+    EXPECT_EQ(rx.got[0], make_app(7, 30));
+    EXPECT_EQ(rx.c().plain, 1u);
+}
+
+TEST(FecReadStream, LosslessInOrder)
 {
     std::mt19937 rng(1);
-    auto         enc = make_enc(6, 8);
+    sender       tx(6, 8);
     auto         apps = make_apps(200, &rng);
-    auto         all = encode_all(enc, apps);
+    auto         all = tx.encode_all(apps);
     receiver     rx;
-    for (const auto &s : all)
+    for (const auto& s : all)
     {
         rx.push(s.data);
     }
     EXPECT_EQ(rx.got, apps);
-    EXPECT_EQ(rx.dec.recovered(), 0u);
-    EXPECT_EQ(rx.dec.decode_fail(), 0u);
-    EXPECT_EQ(rx.dec.missing_shards(), 0u);
+    EXPECT_EQ(rx.c().recovered, 0u);
+    EXPECT_EQ(rx.c().decode_fail, 0u);
+    EXPECT_EQ(rx.c().missing_data + rx.c().missing_parity, 0u);
 }
 
 /* A receiver starts at the first data shard it sees, so the block under test follows a
  * complete one. */
-TEST(FecDecoder, RecoversEveryPairOfErasures)
+TEST(FecReadStream, RecoversEveryPairOfErasures)
 {
     std::mt19937 rng(2);
     for (int a = 0; a < 8; a++)
     {
         for (int b = a + 1; b < 8; b++)
         {
-            auto     enc = make_enc(6, 8);
+            sender   tx(6, 8);
             auto     apps = make_apps(12, &rng);
-            auto     all = encode_all(enc, apps);
+            auto     all = tx.encode_all(apps);
             receiver rx;
             ASSERT_EQ(all.size(), 16u);
             for (int i = 0; i < 16; i++)
@@ -507,17 +385,17 @@ TEST(FecDecoder, RecoversEveryPairOfErasures)
                 }
             }
             EXPECT_EQ(rx.got, apps) << "lost " << a << "," << b;
-            EXPECT_EQ(rx.dec.decode_fail(), 0u);
+            EXPECT_EQ(rx.c().decode_fail, 0u);
         }
     }
 }
 
-TEST(FecDecoder, Kn20N31MaxErasures)
+TEST(FecReadStream, Kn20N31MaxErasures)
 {
     std::mt19937 rng(3);
-    auto         enc = make_enc(20, 31);
+    sender       tx(20, 31);
     auto         apps = make_apps(40, &rng);
-    auto         all = encode_all(enc, apps);
+    auto         all = tx.encode_all(apps);
     ASSERT_EQ(all.size(), 62u);
     std::vector<size_t> order(31);
     for (size_t i = 0; i < 31; i++)
@@ -537,75 +415,64 @@ TEST(FecDecoder, Kn20N31MaxErasures)
     EXPECT_EQ(rx.got, apps);
 }
 
-TEST(FecDecoder, ParityAfterNextBlockDataStillInOrder)
+TEST(FecReadStream, ParityAfterNextBlockDataStillInOrder)
 {
     std::mt19937 rng(4);
-    auto         enc = make_enc(4, 6);
+    sender       tx(4, 6);
     auto         apps = make_apps(8, &rng);
-    auto         all = encode_all(enc, apps); /* d0..d3 p0 p1 d4..d7 p0 p1 */
+    auto         all = tx.encode_all(apps); /* d0..d3 p0 p1 d4..d7 p0 p1 */
     ASSERT_EQ(all.size(), 12u);
     receiver rx;
     /* Block 0 loses d1; its parity is spread past block 1's data. */
-    rx.push(all[0].data);
-    rx.push(all[2].data);
-    rx.push(all[3].data);
-    rx.push(all[6].data);
-    rx.push(all[7].data);
+    for (size_t i : {0, 2, 3, 6, 7})
+    {
+        rx.push(all[i].data);
+    }
     EXPECT_EQ(rx.got.size(), 1u); /* d0; the rest waits behind the hole */
-    rx.push(all[4].data);
+    rx.push(all[4].data);         /* block 0's parity row 0 rebuilds d1 */
     EXPECT_EQ(rx.got.size(), 6u);
-    rx.push(all[8].data);
-    rx.push(all[9].data);
-    rx.push(all[5].data);
-    rx.push(all[10].data);
-    rx.push(all[11].data);
+    for (size_t i : {8, 9, 5, 10, 11})
+    {
+        rx.push(all[i].data);
+    }
     EXPECT_EQ(rx.got, apps);
-    EXPECT_EQ(rx.dec.recovered(), 1u);
+    EXPECT_EQ(rx.c().recovered, 1u);
+    EXPECT_EQ(rx.c().data, 7u);
 }
 
-TEST(FecDecoder, FlushedPartialBlockRecovers)
+TEST(FecReadStream, FlushedPartialBlockRecovers)
 {
     std::mt19937 rng(5);
-    auto         enc = make_enc(6, 9);
+    sender       tx(6, 9);
     auto         apps = make_apps(4, &rng);
-    auto         all = encode_all(enc, apps);
-    auto         parity = flush(enc);
+    auto         all = tx.encode_all(apps);
+    auto         parity = tx.flush();
     ASSERT_EQ(parity.size(), 3u);
-    shard_header h;
-    ASSERT_TRUE(parse_header(parity[0].data.data(), parity[0].data.size(), &h));
-    EXPECT_EQ(h.k_total, 4);
     receiver rx;
     rx.push(all[0].data);
     rx.push(all[3].data);
     rx.push(parity[0].data);
     rx.push(parity[2].data);
     EXPECT_EQ(rx.got, apps);
-    /* A new block continues the sequence. */
-    auto next = push(enc, make_app(9, 10));
-    ASSERT_TRUE(parse_header(next[0].data.data(), next[0].data.size(), &h));
-    EXPECT_EQ(h.sequence_number, static_cast<uint16_t>(100 + 4));
 }
 
-TEST(FecDecoder, RuntimeKnChangeKeepsSequence)
+TEST(FecReadStream, RuntimeKnChangeKeepsSequence)
 {
-    std::mt19937 rng(6);
-    auto         enc = make_enc(6, 8);
-    auto         apps = make_apps(40, &rng);
+    std::mt19937       rng(6);
+    sender             tx(6, 8);
+    auto               apps = make_apps(40, &rng);
     std::vector<shard> all;
     for (size_t i = 0; i < apps.size(); i++)
     {
         if (i == 15)
         {
-            /* Mid-block: configure() releases the partial block's parity itself. */
-            ASSERT_TRUE(enc.configure(4, 7, k_datagram));
-            auto parity = drain(enc);
-            ASSERT_EQ(parity.size(), 2u);
-            all.insert(all.end(), parity.begin(), parity.end());
+            /* Mid-block: the running block keeps 6/8; the next one is 4/7. */
+            tx.configure(4, 7);
         }
-        auto s = push(enc, apps[i]);
+        auto s = tx.push(apps[i]);
         all.insert(all.end(), s.begin(), s.end());
     }
-    auto tail = flush(enc);
+    auto tail = tx.flush();
     all.insert(all.end(), tail.begin(), tail.end());
     receiver rx;
     for (size_t i = 0; i < all.size(); i++)
@@ -616,15 +483,15 @@ TEST(FecDecoder, RuntimeKnChangeKeepsSequence)
         }
     }
     EXPECT_EQ(rx.got, apps);
-    EXPECT_EQ(rx.dec.decode_fail(), 0u);
+    EXPECT_EQ(rx.c().decode_fail, 0u);
 }
 
-TEST(FecDecoder, SequenceWrapNoLoss)
+TEST(FecReadStream, SequenceWrapNoLoss)
 {
     std::mt19937 rng(7);
-    auto         enc = make_enc(5, 7, 65530);
+    sender       tx(5, 7, 65530);
     auto         apps = make_apps(30, &rng, 200);
-    auto         all = encode_all(enc, apps);
+    auto         all = tx.encode_all(apps);
     receiver     rx;
     for (size_t i = 0; i < all.size(); i++)
     {
@@ -636,15 +503,16 @@ TEST(FecDecoder, SequenceWrapNoLoss)
     EXPECT_EQ(rx.got, apps);
 }
 
-TEST(FecDecoder, HoleWithoutParityGivenUpAtCapThenAtEstimate)
+TEST(FecReadStream, HoleWithoutParityGivenUpAtCapThenAtEstimate)
 {
     fake_clock clk;
     receiver   rx;
-    clk.attach(rx.dec);
+    clk.attach(rx.rs);
     std::mt19937 rng(8);
-    auto         enc = make_enc(4, 6);
+    sender       tx(4, 6);
     auto         apps = make_apps(36, &rng, 100);
-    auto         all = encode_all(enc, apps); /* 9 blocks of 6 shards */
+    auto         all = tx.encode_all(apps); /* 9 blocks of 6 shards */
+    const auto   lost = [&rx] { return rx.c().missing_data; };
     /* Block 0 loses d2 and both parity: nothing can recover it. */
     for (size_t i = 0; i < 6; i++)
     {
@@ -655,16 +523,19 @@ TEST(FecDecoder, HoleWithoutParityGivenUpAtCapThenAtEstimate)
         rx.push(all[i].data);
         clk.advance(1);
     }
-    EXPECT_EQ(rx.got.size(), 2u);
+    EXPECT_EQ(rx.got.size(), 2u); /* d3 waits behind the hole */
     /* No estimate yet: the hole waits about the 250 ms cap from its block's close. */
+    fec_read_stream::time_point at {};
+    ASSERT_TRUE(rx.rs.next_deadline(&at));
+    EXPECT_GT(at, clk.t + std::chrono::milliseconds(240));
     clk.advance(200);
     rx.poll();
-    EXPECT_EQ(rx.got.size(), 2u);
+    EXPECT_EQ(lost(), 0u);
     clk.advance(60);
     rx.poll();
+    EXPECT_EQ(lost(), 1u);
     EXPECT_EQ(rx.got.size(), 3u);
-    EXPECT_EQ(rx.dec.given_up_blocks(), 1u);
-    EXPECT_EQ(rx.dec.take_fail_lost_app_pkts(), 1u);
+    EXPECT_EQ(rx.c().given_up_blocks, 1u);
 
     /* k = 4, n = 2 (c = 6), spread 12 ms: row gap 2 ms. The sender releases parity row j at
      * max(close + 2j, first + 8 + 2j) ms. Slowly filled blocks (data 3 ms apart) get their parity
@@ -684,13 +555,12 @@ TEST(FecDecoder, HoleWithoutParityGivenUpAtCapThenAtEstimate)
         rx.push(all[b * 6 + 5].data);
         clk.advance(10);
     }
-    ASSERT_TRUE(rx.dec.have_spread_estimate());
-    EXPECT_NEAR(rx.dec.spread_estimate_ms(), 12.0, 0.5);
+    ASSERT_TRUE(rx.rs.have_spread_estimate());
+    EXPECT_NEAR(rx.rs.spread_estimate_ms(), 12.0, 0.5);
 
     /* Block 6 fills in a burst (fill 0.2 ms): its parity is due at close + 7.8 and + 9.8 ms. It
      * loses d1 and parity row 0; row 1 still recovers it, though the slow blocks taught nothing
      * longer than 2 ms. */
-    size_t before = rx.got.size();
     rx.push(all[36].data);
     clk.advance_us(100);
     rx.push(all[38].data);
@@ -698,16 +568,15 @@ TEST(FecDecoder, HoleWithoutParityGivenUpAtCapThenAtEstimate)
     rx.push(all[39].data); /* the close */
     clk.advance(9);
     rx.poll();
-    EXPECT_EQ(rx.got.size(), before + 1);
+    EXPECT_EQ(lost(), 1u);
     clk.advance_us(800);
     rx.push(all[41].data);
-    EXPECT_EQ(rx.got.size(), before + 4);
-    EXPECT_EQ(rx.dec.given_up_blocks(), 1u);
+    EXPECT_EQ(rx.c().recovered, 1u);
+    EXPECT_EQ(rx.c().given_up_blocks, 1u);
     clk.advance(10);
 
     /* Block 7, also a burst, loses d1 and both parity: given up after close + 9.8 ms + margin,
      * not at the 250 ms cap. */
-    before = rx.got.size();
     rx.push(all[42].data);
     clk.advance_us(100);
     rx.push(all[44].data);
@@ -715,15 +584,14 @@ TEST(FecDecoder, HoleWithoutParityGivenUpAtCapThenAtEstimate)
     rx.push(all[45].data);
     clk.advance(12);
     rx.poll();
-    EXPECT_EQ(rx.got.size(), before + 1);
+    EXPECT_EQ(lost(), 1u);
     clk.advance(10);
     rx.poll();
-    EXPECT_EQ(rx.got.size(), before + 3);
+    EXPECT_EQ(lost(), 2u);
     clk.advance(10);
 
     /* Block 8 fills slowly and loses d1 and both parity: its parity was due at close + 2 ms, so
      * it is given up well before a burst block would be. */
-    before = rx.got.size();
     rx.push(all[48].data);
     clk.advance(6);
     rx.push(all[50].data);
@@ -731,22 +599,23 @@ TEST(FecDecoder, HoleWithoutParityGivenUpAtCapThenAtEstimate)
     rx.push(all[51].data);
     clk.advance(4);
     rx.poll();
-    EXPECT_EQ(rx.got.size(), before + 1);
+    EXPECT_EQ(lost(), 2u);
     clk.advance(6);
     rx.poll();
-    EXPECT_EQ(rx.got.size(), before + 3);
-    EXPECT_EQ(rx.dec.given_up_blocks(), 3u);
+    EXPECT_EQ(lost(), 3u);
+    EXPECT_EQ(rx.c().given_up_blocks, 3u);
+    EXPECT_EQ(rx.got.size(), 33u);
 }
 
-TEST(FecDecoder, DataOnlyStreamSkipsHoleOnNextData)
+TEST(FecReadStream, DataOnlyStreamSkipsHoleOnNextData)
 {
-    auto     enc = make_enc(1, 1);
-    receiver rx;
+    sender             tx(1, 1);
+    receiver           rx;
     std::vector<bytes> sent;
     for (uint32_t i = 0; i < 300; i++)
     {
         const bytes a = make_app(i, 20);
-        auto        s = push(enc, a);
+        auto        s = tx.push(a);
         ASSERT_EQ(s.size(), 1u);
         if (i == 280)
         {
@@ -757,17 +626,19 @@ TEST(FecDecoder, DataOnlyStreamSkipsHoleOnNextData)
     }
     /* Past the data-only threshold a hole goes as soon as later data shows up. */
     EXPECT_EQ(rx.got, sent);
-    EXPECT_EQ(rx.dec.missing_shards(), 1u);
+    EXPECT_EQ(rx.c().missing_data, 1u);
+    fec_read_stream::time_point at {};
+    EXPECT_FALSE(rx.rs.next_deadline(&at));
 }
 
-TEST(FecDecoder, MissingParityCountedWhenBlockDone)
+TEST(FecReadStream, MissingParityCountedWhenBlockDone)
 {
     fake_clock clk;
     receiver   rx;
-    clk.attach(rx.dec);
+    clk.attach(rx.rs);
     std::mt19937 rng(9);
-    auto         enc = make_enc(4, 6);
-    auto         all = encode_all(enc, make_apps(8, &rng, 50));
+    sender       tx(4, 6);
+    auto         all = tx.encode_all(make_apps(8, &rng, 50));
     for (size_t i = 0; i < all.size(); i++)
     {
         if (i != 5)
@@ -775,47 +646,44 @@ TEST(FecDecoder, MissingParityCountedWhenBlockDone)
             rx.push(all[i].data);
         }
     }
-    EXPECT_EQ(rx.dec.take_missing_parity(), 0u);
+    EXPECT_EQ(rx.c().missing_parity, 0u);
     clk.advance(300);
     rx.poll();
-    EXPECT_EQ(rx.dec.take_missing_parity(), 1u);
-    EXPECT_EQ(rx.dec.decode_fail(), 0u);
+    EXPECT_EQ(rx.c().missing_parity, 1u);
+    EXPECT_EQ(rx.c().decode_fail, 0u);
 }
 
-TEST(FecDecoder, PeerRestartTakesNewReference)
+TEST(FecReadStream, PeerRestartTakesNewReference)
 {
     std::mt19937 rng(10);
-    auto         a = make_enc(4, 6, 1000);
-    auto         b = make_enc(4, 6, 30000);
+    sender       a(4, 6, 1000);
+    sender       b(4, 6, 30000);
     auto         apps_a = make_apps(10, &rng);
     auto         apps_b = make_apps(10, &rng);
     receiver     rx;
-    for (const auto &s : encode_all(a, apps_a))
+    for (const auto& s : a.encode_all(apps_a))
     {
         rx.push(s.data);
     }
-    for (const auto &s : encode_all(b, apps_b))
+    for (const auto& s : b.encode_all(apps_b))
     {
         rx.push(s.data);
     }
     std::vector<bytes> want = apps_a;
-    /* a's last two data shards wait in their open block: they were released in order. */
     want.insert(want.end(), apps_b.begin(), apps_b.end());
     EXPECT_EQ(rx.got, want);
-    EXPECT_EQ(rx.dec.new_references(), 1u);
+    EXPECT_EQ(rx.c().new_references, 1u);
 }
 
-TEST(FecDecoder, LateDataBehindReleaseIgnored)
+TEST(FecReadStream, LateDataBehindReleaseIgnored)
 {
-    fake_clock clk;
-    receiver   rx;
-    clk.attach(rx.dec);
-    auto     enc = make_enc(1, 1);
+    sender             tx(1, 1);
     std::vector<bytes> wire;
     for (uint32_t i = 0; i < 300; i++)
     {
-        wire.push_back(push(enc, make_app(i, 10))[0].data);
+        wire.push_back(tx.push(make_app(i, 10))[0].data);
     }
+    receiver rx;
     for (size_t i = 0; i < 300; i++)
     {
         if (i != 290)
@@ -824,13 +692,18 @@ TEST(FecDecoder, LateDataBehindReleaseIgnored)
         }
     }
     ASSERT_EQ(rx.got.size(), 299u);
+    EXPECT_EQ(rx.c().missing_data, 1u);
+    /* Late, behind the release point: released in order it would come after 299. */
     rx.push(wire[290]);
     EXPECT_EQ(rx.got.size(), 299u);
-    EXPECT_EQ(rx.dec.late_blocks(), 1u);
-    EXPECT_EQ(rx.dec.new_references(), 0u);
+    EXPECT_EQ(rx.c().late, 1u);
+    EXPECT_EQ(rx.c().new_references, 0u);
+    rx.push(wire[299]);
+    EXPECT_EQ(rx.got.size(), 299u);
+    EXPECT_EQ(rx.c().duplicates, 1u);
 }
 
-TEST(FecDecoder, KnMismatchCounted)
+TEST(FecReadStream, KnMismatchCounted)
 {
     receiver rx;
     uint8_t  p[4 + 2 + 16] {};
@@ -838,20 +711,20 @@ TEST(FecDecoder, KnMismatchCounted)
     rx.push(bytes(p, p + sizeof(p)));
     ASSERT_TRUE(write_parity_header(p, 50, 3, 4, 1));
     rx.push(bytes(p, p + sizeof(p)));
-    EXPECT_EQ(rx.dec.kn_mismatch(), 1u);
+    EXPECT_EQ(rx.c().kn_mismatch, 1u);
     /* The replaced block is counted: it got one of its two parity shards. */
-    EXPECT_EQ(rx.dec.take_missing_parity(), 1u);
+    EXPECT_EQ(rx.c().missing_parity, 1u);
     const uint8_t junk[] = {0x7F};
     rx.push(bytes(junk, junk + 1));
-    EXPECT_EQ(rx.dec.hdr_errors(), 1u);
+    EXPECT_EQ(rx.c().hdr_errors, 1u);
 }
 
-TEST(FecDecoder, LateParityFarBehindDropped)
+TEST(FecReadStream, LateParityFarBehindDropped)
 {
     std::mt19937 rng(12);
-    auto         enc = make_enc(4, 5);
+    sender       tx(4, 5);
     auto         apps = make_apps(204, &rng, 50);
-    auto         all = encode_all(enc, apps); /* 51 blocks of 5 shards */
+    auto         all = tx.encode_all(apps); /* 51 blocks of 5 shards */
     receiver     rx;
     for (size_t i = 0; i < 250; i++)
     {
@@ -863,7 +736,7 @@ TEST(FecDecoder, LateParityFarBehindDropped)
     ASSERT_EQ(rx.got.size(), 200u);
     /* Block 0's parity arrives 196 data shards late: dropped, not a new session. */
     rx.push(all[4].data);
-    EXPECT_EQ(rx.dec.new_references(), 0u);
+    EXPECT_EQ(rx.c().new_references, 0u);
     for (size_t i = 250; i < 255; i++)
     {
         rx.push(all[i].data);
@@ -871,52 +744,52 @@ TEST(FecDecoder, LateParityFarBehindDropped)
     EXPECT_EQ(rx.got, apps);
 }
 
-TEST(FecDecoder, DuplicateParityOfDoneBlockIgnored)
+TEST(FecReadStream, DuplicateParityOfDoneBlockIgnored)
 {
     fake_clock clk;
     receiver   rx;
-    clk.attach(rx.dec);
+    clk.attach(rx.rs);
     std::mt19937 rng(13);
-    auto         enc = make_enc(4, 6);
-    auto         all = encode_all(enc, make_apps(8, &rng, 50));
-    for (const auto &s : all)
+    sender       tx(4, 6);
+    auto         all = tx.encode_all(make_apps(8, &rng, 50));
+    for (const auto& s : all)
     {
         rx.push(s.data);
     }
     clk.advance(300);
     rx.poll();
-    EXPECT_EQ(rx.dec.take_missing_parity(), 0u);
+    EXPECT_EQ(rx.c().missing_parity, 0u);
     rx.push(all[5].data);
     clk.advance(300);
     rx.poll();
-    EXPECT_EQ(rx.dec.take_missing_parity(), 0u);
-    EXPECT_EQ(rx.dec.decode_fail(), 0u);
+    EXPECT_EQ(rx.c().missing_parity, 0u);
+    EXPECT_EQ(rx.c().decode_fail, 0u);
 }
 
-TEST(FecDecoder, DataOnlyRunOfHolesIsOneBlock)
+TEST(FecReadStream, DataOnlyRunOfHolesIsOneBlock)
 {
-    auto     enc = make_enc(1, 1);
+    sender   tx(1, 1);
     receiver rx;
     for (uint32_t i = 0; i < 300; i++)
     {
-        auto s = push(enc, make_app(i, 20));
+        auto s = tx.push(make_app(i, 20));
         if (i < 280 || i >= 290)
         {
             rx.push(s[0].data);
         }
     }
     EXPECT_EQ(rx.got.size(), 290u);
-    EXPECT_EQ(rx.dec.missing_shards(), 10u);
-    EXPECT_EQ(rx.dec.given_up_blocks(), 1u);
+    EXPECT_EQ(rx.c().missing_data, 10u);
+    EXPECT_EQ(rx.c().given_up_blocks, 1u);
 }
 
-TEST(FecDecoder, ShortFlushedBlockKeepsNextBlockWait)
+TEST(FecReadStream, ShortFlushedBlockKeepsNextBlockWait)
 {
     fake_clock clk;
     receiver   rx;
-    clk.attach(rx.dec);
+    clk.attach(rx.rs);
     std::mt19937 rng(14);
-    auto         enc = make_enc(8, 10);
+    sender       tx(8, 10);
     auto         apps = make_apps(27, &rng, 100);
     /* Blocks 100 and 108 (k = 8) teach a spread: parity 1 and 2 ms after the close. */
     for (size_t b = 0; b < 2; b++)
@@ -924,36 +797,36 @@ TEST(FecDecoder, ShortFlushedBlockKeepsNextBlockWait)
         std::vector<shard> parity;
         for (size_t i = 0; i < 8; i++)
         {
-            auto s = push(enc, apps[b * 8 + i]);
+            auto s = tx.push(apps[b * 8 + i]);
             rx.push(s[0].data);
             parity.assign(s.begin() + 1, s.end());
             clk.advance(1);
         }
-        for (const auto &p : parity)
+        for (const auto& p : parity)
         {
             rx.push(p.data);
             clk.advance(1);
         }
         clk.advance(5);
     }
-    /* A reconfigure flushes block 116 after 3 data shards. */
+    /* A flush closes block 116 after 3 data shards. */
     for (size_t i = 16; i < 19; i++)
     {
-        rx.push(push(enc, apps[i])[0].data);
+        rx.push(tx.push(apps[i])[0].data);
         clk.advance(1);
     }
-    for (const auto &p : flush(enc))
+    for (const auto& p : tx.flush())
     {
         rx.push(p.data);
         clk.advance(1);
     }
-    ASSERT_TRUE(rx.dec.have_spread_estimate());
+    ASSERT_TRUE(rx.rs.have_spread_estimate());
     /* Block 119 (k = 8 again) loses 120 and fills slowly. Taken as a 3-long block, its close
      * would be 121's arrival and 120 would be given up long before the parity comes. */
     std::vector<shard> parity;
     for (size_t i = 19; i < 27; i++)
     {
-        auto s = push(enc, apps[i]);
+        auto s = tx.push(apps[i]);
         if (i != 20)
         {
             rx.push(s[0].data);
@@ -964,21 +837,21 @@ TEST(FecDecoder, ShortFlushedBlockKeepsNextBlockWait)
     ASSERT_EQ(parity.size(), 2u);
     rx.push(parity[0].data);
     EXPECT_EQ(rx.got, apps);
-    EXPECT_EQ(rx.dec.given_up_blocks(), 0u);
+    EXPECT_EQ(rx.c().given_up_blocks, 0u);
 }
 
-TEST(FecDecoder, RandomLossStreamRecoversWithinParity)
+TEST(FecReadStream, RandomLossStreamRecoversWithinParity)
 {
-    std::mt19937 rng(11);
-    auto         enc = make_enc(10, 14);
-    auto         apps = make_apps(1000, &rng);
+    std::mt19937       rng(11);
+    sender             tx(10, 14);
+    auto               apps = make_apps(1000, &rng);
     std::vector<shard> all;
     std::vector<int>   block_of_shard;
     int                block = 0;
-    for (const auto &a : apps)
+    for (const auto& a : apps)
     {
-        auto s = push(enc, a);
-        for (const auto &x : s)
+        auto s = tx.push(a);
+        for (const auto& x : s)
         {
             all.push_back(x);
             block_of_shard.push_back(block);
@@ -989,9 +862,9 @@ TEST(FecDecoder, RandomLossStreamRecoversWithinParity)
         }
     }
     /* Lose up to 4 shards of each block (any of its 14). */
-    std::vector<int> lost(static_cast<size_t>(block + 1), 0);
+    std::vector<int>            lost(static_cast<size_t>(block + 1), 0);
     std::bernoulli_distribution drop(0.2);
-    receiver rx;
+    receiver                    rx;
     for (size_t i = 0; i < all.size(); i++)
     {
         const int b = block_of_shard[i];
@@ -1003,33 +876,49 @@ TEST(FecDecoder, RandomLossStreamRecoversWithinParity)
         rx.push(all[i].data);
     }
     EXPECT_EQ(rx.got, apps);
-    EXPECT_EQ(rx.dec.decode_fail(), 0u);
-    EXPECT_GT(rx.dec.recovered(), 0u);
+    EXPECT_EQ(rx.c().decode_fail, 0u);
+    EXPECT_GT(rx.c().recovered, 0u);
 }
 
-TEST(FecDecoder, ReleasesDatagramsBehindReleasePoint)
+TEST(FecReadStream, ReleasesDatagramsBehindGiveUpPoint)
 {
-    std::mt19937 rng(15);
-    auto         enc = make_enc(4, 6);
-    auto         all = encode_all(enc, make_apps(400, &rng, 60)); /* 100 blocks */
-    decoder          dec;
-    int              released = 0;
-    for (const auto &s : all)
+    std::mt19937    rng(15);
+    sender          tx(4, 6);
+    auto            all = tx.encode_all(make_apps(400, &rng, 60)); /* 100 blocks */
+    fec_read_stream rs;
+    int             released = 0;
+    for (const auto& s : all)
     {
-        auto *bytes = new std::byte[s.data.size()];
-        std::memcpy(bytes, s.data.data(), s.data.size());
-        payload_list out;
-        dec.push_air(bfc::shared_sized_buffer::adopt(bytes, s.data.size(), s.data.size(),
-                                                     [&released](std::byte *p)
-                                                     {
-                                                         released++;
-                                                         delete[] p;
-                                                     }),
-                     &out);
+        auto* b = new std::byte[s.data.size()];
+        std::memcpy(b, s.data.data(), s.data.size());
+        rs.push(bfc::shared_sized_buffer::adopt(b, s.data.size(), s.data.size(),
+                                                [&released](std::byte* p)
+                                                {
+                                                    released++;
+                                                    delete[] p;
+                                                }),
+                lc_type::fec);
+        while (!rs.pop().empty())
+        {
+        }
     }
-    /* Only data shards the last blocks may still decode with, and the parity of blocks still
+    /* Only data shards the last blocks may still rebuild with, and the parity of blocks still
      * open for late parity, may be held: never the stream's history. */
     EXPECT_GE(released, static_cast<int>(all.size()) - 64);
-    dec.reset_rx();
+    rs.reset();
     EXPECT_EQ(released, static_cast<int>(all.size()));
+}
+
+TEST(FecReadStream, OutputRingDropsOldest)
+{
+    receiver rx;
+    rx.rs.set_output_capacity(2);
+    for (uint32_t i = 0; i < 3; i++)
+    {
+        rx.rs.push(to_buf(make_app(i, 10), 0), lc_type::plain);
+    }
+    EXPECT_EQ(rx.c().drop_output, 1u);
+    rx.take();
+    ASSERT_EQ(rx.got.size(), 2u);
+    EXPECT_EQ(app_index(rx.got[0]), 1u);
 }
