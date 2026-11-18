@@ -1,6 +1,7 @@
 #include "winject_fec/write_stream.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <random>
 #include <utility>
@@ -14,6 +15,7 @@ namespace winject::fec
 namespace
 {
 constexpr size_t k_default_output_capacity = 256;
+constexpr size_t k_default_input_capacity = 256;
 }
 
 struct fec_write_stream::impl : std::enable_shared_from_this<impl>
@@ -24,6 +26,8 @@ struct fec_write_stream::impl : std::enable_shared_from_this<impl>
         out_shard  s;
     };
 
+    /* Before link: the reactor points at its ring until link lets go. */
+    detail::stream_input<bfc::shared_sized_buffer, impl> in;
     detail::reactor_link                link;
     clock_fn                            clock;
     block_encoder                       enc;
@@ -35,7 +39,7 @@ struct fec_write_stream::impl : std::enable_shared_from_this<impl>
     size_t                              out_capacity = 0;
 
     stream_counter c_plain, c_data, c_parity, c_blocks, c_flushed, c_drop_no_headroom,
-        c_drop_size, c_drop_parity_alloc, c_drop_output, c_kernel_us;
+        c_drop_size, c_drop_parity_alloc, c_drop_output, c_kernel_us, c_drop_input;
 
     impl()
     {
@@ -43,6 +47,27 @@ struct fec_write_stream::impl : std::enable_shared_from_this<impl>
         /* Random start id: a restarted sender must not replay ids the receiver still holds. */
         tx_seq = static_cast<uint16_t>(rd());
         set_output_capacity(k_default_output_capacity);
+        set_input_capacity(k_default_input_capacity);
+    }
+
+    void set_input_capacity(size_t n)
+    {
+        in.set_capacity(n);
+    }
+
+    /* Any thread: queues the datagram for the reactor (oldest dropped when full). */
+    void enqueue(bfc::shared_sized_buffer&& datagram)
+    {
+        if (!in.push(std::move(datagram)))
+        {
+            c_drop_input.add_shared();
+        }
+    }
+
+    /* Stream thread: what other threads gave, in order, before anything after it. */
+    void drain_input()
+    {
+        in.drain(*this, [this](bfc::shared_sized_buffer&& b) { push(std::move(b)); });
     }
 
     time_point now() const
@@ -211,9 +236,43 @@ struct fec_write_stream::impl : std::enable_shared_from_this<impl>
 
 fec_write_stream::fec_write_stream() : d(std::make_shared<impl>()) {}
 
-/* The timer and posted calls hold the impl weakly or keep it alive themselves, so it is torn
- * down (and its timer cancelled) by whichever thread drops the last reference. */
-fec_write_stream::~fec_write_stream() = default;
+/* The reactor walks its contexts (the input ring among them) unlocked, so the ring leaves it on
+ * the reactor thread: from another thread the impl is handed to the reactor and torn down there.
+ * The timer holds the impl weakly. */
+fec_write_stream::~fec_write_stream()
+{
+    if (!d || d->link.on_thread())
+    {
+        return;
+    }
+    const auto r = d->link.get();
+    r->wake_up(
+        [d = std::move(d)]
+        {
+            d->link.unbind_input();
+            d->link.disarm();
+        });
+}
+
+/* A control call: on the stream thread, after the pushes queued before it. */
+void fec_write_stream::control(std::function<void(impl&)> fn)
+{
+    if (d->link.on_thread())
+    {
+        d->drain_input();
+        fn(*d);
+        return;
+    }
+    d->in.add_control(std::move(fn));
+    d->link.get()->wake_up(
+        [w = std::weak_ptr<impl>(d)]
+        {
+            if (auto s = w.lock())
+            {
+                s->drain_input();
+            }
+        });
+}
 
 bool fec_write_stream::attach(std::string_view reactor_name)
 {
@@ -229,7 +288,15 @@ bool fec_write_stream::attach(std::string_view reactor_name)
 void fec_write_stream::attach(std::shared_ptr<stream_reactor> reactor)
 {
     d->link.attach(std::move(reactor));
-    d->link.run([d = d] { d->rearm(); });
+    d->link.bind_input(d->in.ring(),
+                       [w = std::weak_ptr<impl>(d)]
+                       {
+                           if (auto s = w.lock())
+                           {
+                               s->drain_input();
+                           }
+                       });
+    control([](impl& s) { s.rearm(); });
 }
 
 void fec_write_stream::set_clock(clock_fn fn)
@@ -239,8 +306,8 @@ void fec_write_stream::set_clock(clock_fn fn)
 
 void fec_write_stream::set_tx_buffers(size_t headroom, shard_alloc alloc)
 {
-    d->link.run([d = d, headroom, alloc = std::move(alloc)]() mutable
-                { d->enc.set_tx_buffers(headroom, std::move(alloc)); });
+    control([headroom, alloc = std::move(alloc)](impl& s) mutable
+            { s.enc.set_tx_buffers(headroom, std::move(alloc)); });
 }
 
 size_t fec_write_stream::push_offset() const
@@ -250,7 +317,12 @@ size_t fec_write_stream::push_offset() const
 
 void fec_write_stream::set_output_capacity(size_t shards)
 {
-    d->link.run([d = d, shards] { d->set_output_capacity(shards); });
+    control([shards](impl& s) { s.set_output_capacity(shards); });
+}
+
+void fec_write_stream::set_input_capacity(size_t datagrams)
+{
+    d->set_input_capacity(datagrams);
 }
 
 bool fec_write_stream::valid(const config& cfg)
@@ -280,13 +352,19 @@ bool fec_write_stream::configure(const config& cfg)
         /* Build the full block's encode tables now, not on the stream's first block close. */
         (void)detail::kn_encode_tables_for(cfg.k, cfg.n);
     }
-    d->link.run([d = d, cfg] { d->cfg = cfg; });
+    control([cfg](impl& s) { s.cfg = cfg; });
     return true;
 }
 
 void fec_write_stream::push(bfc::shared_sized_buffer datagram)
 {
-    d->link.run([d = d, buf = std::move(datagram)]() mutable { d->push(std::move(buf)); });
+    if (d->link.on_thread())
+    {
+        d->drain_input();
+        d->push(std::move(datagram));
+        return;
+    }
+    d->enqueue(std::move(datagram));
 }
 
 out_shard fec_write_stream::pop()
@@ -302,11 +380,11 @@ std::shared_ptr<write_output_queue> fec_write_stream::output() const
 
 void fec_write_stream::poll()
 {
-    d->link.run(
-        [d = d]
+    control(
+        [](impl& s)
         {
-            d->service(d->now());
-            d->rearm();
+            s.service(s.now());
+            s.rearm();
         });
 }
 
@@ -343,6 +421,7 @@ fec_write_stream::counters fec_write_stream::get_counters() const
     c.drop_parity_alloc = d->c_drop_parity_alloc.load();
     c.drop_output = d->c_drop_output.load();
     c.encode_kernel_us = d->c_kernel_us.load();
+    c.drop_input = d->c_drop_input.load();
     return c;
 }
 

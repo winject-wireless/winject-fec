@@ -4,11 +4,16 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string_view>
+#include <utility>
 
 #include <bfc/cv_reactor.hpp>
+#include <bfc/event_queue.hpp>
 #include <bfc/object_registry.hpp>
 
 namespace winject::fec
@@ -28,6 +33,11 @@ public:
     {
         v.store(v.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
     }
+    /* From any thread, concurrently with other writers. */
+    void add_shared()
+    {
+        v.fetch_add(1, std::memory_order_relaxed);
+    }
     [[nodiscard]] uint64_t load() const
     {
         return v.load(std::memory_order_relaxed);
@@ -41,9 +51,10 @@ namespace detail
 {
 
 /*
- * A stream's link to its reactor: one timer, armed at the stream's earliest deadline, and
- * posting calls made off the reactor thread onto it. Without a reactor (manual mode) the caller
- * runs everything on its own thread and drives the deadlines with poll().
+ * A stream's link to its reactor: the stream's input ring registered as a reactor context (the
+ * reactor drains it when a push wakes it) and one timer armed at the stream's earliest deadline.
+ * Without a reactor (manual mode) the caller runs everything on its own thread and drives the
+ * deadlines with poll().
  */
 class reactor_link
 {
@@ -52,34 +63,52 @@ public:
 
     ~reactor_link()
     {
+        unbind_input();
         disarm();
     }
 
     void attach(std::shared_ptr<stream_reactor> r)
     {
+        unbind_input();
         disarm();
         reactor = std::move(r);
+    }
+    /* Registers the input ring: a push wakes the reactor, which calls on_input to drain it. The
+     * reactor keeps a plain pointer to the ring until unbind_input(). */
+    void bind_input(stream_reactor::context& ring, stream_reactor::callback_t on_input)
+    {
+        unbind_input();
+        if (!reactor)
+        {
+            return;
+        }
+        ring.set_reactor(reactor);
+        (void)reactor->add_read_rdy(ring, std::move(on_input));
+        input = &ring;
+    }
+    /* On the reactor thread (or with the reactor stopped): the reactor walks its contexts
+     * unlocked. */
+    void unbind_input()
+    {
+        if (input != nullptr && reactor)
+        {
+            (void)reactor->remove_read_rdy(*input);
+            input->set_reactor(nullptr);
+        }
+        input = nullptr;
     }
     [[nodiscard]] bool attached() const
     {
         return static_cast<bool>(reactor);
     }
+    [[nodiscard]] const std::shared_ptr<stream_reactor>& get() const
+    {
+        return reactor;
+    }
     /* True when the caller may touch the stream directly. */
     [[nodiscard]] bool on_thread() const
     {
         return !reactor || reactor->is_reactor_thread();
-    }
-    /* Runs fn on the reactor thread (now when already there or in manual mode). */
-    void run(std::function<void()> fn)
-    {
-        if (on_thread())
-        {
-            fn();
-        }
-        else
-        {
-            reactor->wake_up(std::move(fn));
-        }
     }
     /* Arms the one timer for at (none: disarms); cb runs on the reactor thread. Re-arming for
      * the same deadline keeps the timer. */
@@ -122,9 +151,99 @@ public:
 
 private:
     std::shared_ptr<stream_reactor> reactor;
+    stream_reactor::context*        input = nullptr;
     bool                            armed = false;
     time_point                      armed_at {};
     stream_reactor::timer_t::timer_id_t timer_id {};
+};
+
+}  // namespace detail
+
+namespace detail
+{
+
+/*
+ * A stream's input from other threads, in the order it was given: items (datagrams, LC bodies) in
+ * a bfc lossy ring the reactor drains when a push wakes it, and control calls (configure, reset,
+ * ...) beside it. Each takes a ticket; the drain runs every control call ticketed before the next
+ * item, so a configure() between two pushes applies between them. Items are dropped (oldest
+ * first) when the ring is full, control calls never.
+ */
+template <typename T, typename Owner>
+class stream_input
+{
+public:
+    using control_fn = std::function<void(Owner&)>;
+    struct entry
+    {
+        T        item;
+        uint64_t ticket = 0;
+    };
+    using ring_t = bfc::reactive_circular_lossy_queue<entry>;
+
+    void set_capacity(size_t n)
+    {
+        ring_.set_capacity(n);
+        capacity.store(n, std::memory_order_relaxed);
+    }
+    [[nodiscard]] ring_t& ring()
+    {
+        return ring_;
+    }
+    /* Any thread. False when the ring dropped its oldest item to take this one. */
+    bool push(T&& item)
+    {
+        const size_t cap = capacity.load(std::memory_order_relaxed);
+        const uint64_t t = tickets.fetch_add(1, std::memory_order_relaxed);
+        return !(ring_.push(entry {std::move(item), t}) == cap && cap > 0);
+    }
+    /* Any thread. */
+    void add_control(control_fn fn)
+    {
+        const uint64_t t = tickets.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lg(mtx);
+        controls.push_back({t, std::move(fn)});
+    }
+    /* Stream thread: control calls and items in ticket order. */
+    template <typename F>
+    void drain(Owner& owner, F&& on_item)
+    {
+        for (;;)
+        {
+            std::optional<entry> e = ring_.pop();
+            run_controls(owner, e ? e->ticket : UINT64_MAX);
+            if (!e)
+            {
+                return;
+            }
+            on_item(std::move(e->item));
+        }
+    }
+
+private:
+    void run_controls(Owner& owner, uint64_t before)
+    {
+        for (;;)
+        {
+            control_fn fn;
+            {
+                std::lock_guard<std::mutex> lg(mtx);
+                if (controls.empty() || controls.front().first >= before)
+                {
+                    return;
+                }
+                fn = std::move(controls.front().second);
+                controls.pop_front();
+            }
+            fn(owner);
+        }
+    }
+
+    ring_t                                         ring_;
+    std::atomic<size_t>                            capacity {0};
+    std::atomic<uint64_t>                          tickets {0};
+    std::mutex                                     mtx;
+    std::deque<std::pair<uint64_t, control_fn>>    controls;
 };
 
 }  // namespace detail

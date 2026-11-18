@@ -3,6 +3,8 @@
 
 #include "winject_fec/write_stream.hpp"
 
+#include <atomic>
+#include <memory>
 #include <thread>
 
 using namespace fec_test;
@@ -420,4 +422,152 @@ TEST(FecStreamsReactor, ReadStreamGivesUpOnItsTimer)
         n++;
     }
     EXPECT_EQ(n, 3);
+}
+
+/* --- the input ring --- */
+
+TEST(FecStreamsReactor, CrossThreadPushesKeepOrder)
+{
+    running_reactor  rr;
+    fec_write_stream ws;
+    ws.attach(rr.r);
+    ws.set_input_capacity(4096);
+    ws.set_output_capacity(8192);
+    ASSERT_TRUE(ws.configure(fec_cfg(8, 10, 0, 5)));
+    constexpr uint32_t k_count = 1000;
+    std::thread        producer(
+        [&]
+        {
+            for (uint32_t i = 0; i < k_count; i++)
+            {
+                ws.push(to_buf(make_app(i, 40), ws.push_offset()));
+            }
+        });
+    std::vector<out_shard> data;
+    const bool all = wait_for(
+        [&]
+        {
+            for (auto s = ws.pop(); s.type != shard_type::none; s = ws.pop())
+            {
+                if (s.type == shard_type::data)
+                {
+                    data.push_back(std::move(s));
+                }
+            }
+            return data.size() == k_count;
+        });
+    producer.join();
+    ASSERT_TRUE(all);
+    for (uint32_t i = 0; i < k_count; i++)
+    {
+        const shard_header h = header(data[i]);
+        EXPECT_EQ(static_cast<uint16_t>(h.sequence_number - header(data[0]).sequence_number), i);
+    }
+    EXPECT_EQ(ws.get_counters().drop_input, 0u);
+}
+
+TEST(FecStreamsReactor, ControlCallsRunAfterEarlierPushes)
+{
+    running_reactor  rr;
+    fec_write_stream ws;
+    ws.attach(rr.r);
+    for (uint32_t i = 0; i < 3; i++)
+    {
+        ws.push(to_buf(make_app(i, 40), ws.push_offset())); /* plain: FEC is off */
+    }
+    ASSERT_TRUE(ws.configure(fec_cfg(4, 6)));
+    for (uint32_t i = 3; i < 7; i++)
+    {
+        ws.push(to_buf(make_app(i, 40), ws.push_offset()));
+    }
+    std::vector<out_shard> got;
+    ASSERT_TRUE(wait_for(
+        [&]
+        {
+            for (auto s = ws.pop(); s.type != shard_type::none; s = ws.pop())
+            {
+                got.push_back(std::move(s));
+            }
+            return got.size() == 9;
+        }));
+    for (size_t i = 0; i < 3; i++)
+    {
+        EXPECT_EQ(got[i].type, shard_type::plain);
+    }
+    for (size_t i = 3; i < 7; i++)
+    {
+        EXPECT_EQ(got[i].type, shard_type::data);
+    }
+}
+
+TEST(FecStreamsReactor, InputRingDropsOldestWhenReactorIsBusy)
+{
+    running_reactor  rr;
+    fec_write_stream ws;
+    ws.attach(rr.r);
+    ws.set_input_capacity(8);
+    std::atomic<bool> busy {true};
+    std::atomic<bool> entered {false};
+    rr.r->wake_up(
+        [&]
+        {
+            entered = true;
+            while (busy)
+            {
+                std::this_thread::sleep_for(ms(1));
+            }
+        });
+    ASSERT_TRUE(wait_for([&] { return entered.load(); }));
+    for (uint32_t i = 0; i < 300; i++)
+    {
+        ws.push(to_buf(make_app(i, 40), ws.push_offset()));
+    }
+    EXPECT_EQ(ws.get_counters().drop_input, 292u);
+    busy = false;
+    std::vector<uint32_t> got;
+    ASSERT_TRUE(wait_for(
+        [&]
+        {
+            for (auto s = ws.pop(); s.type != shard_type::none; s = ws.pop())
+            {
+                got.push_back(app_index(bytes(s.buf.u8(), s.buf.u8() + s.buf.size())));
+            }
+            return got.size() == 8;
+        }));
+    for (uint32_t i = 0; i < 8; i++)
+    {
+        EXPECT_EQ(got[i], 292 + i);
+    }
+}
+
+TEST(FecStreamsReactor, DestroyWhileReactorDrains)
+{
+    running_reactor rr;
+    sender          tx(4, 6);
+    std::vector<bytes> apps;
+    for (uint32_t i = 0; i < 64; i++)
+    {
+        apps.push_back(make_app(i, 100));
+    }
+    const auto all = tx.encode_all(apps);
+    for (int round = 0; round < 50; round++)
+    {
+        auto rs = std::make_unique<fec_read_stream>();
+        rs->attach(rr.r);
+        auto ws = std::make_unique<fec_write_stream>();
+        ws->attach(rr.r);
+        ASSERT_TRUE(ws->configure(fec_cfg(4, 6, 10, 20)));
+        for (const auto& s : all)
+        {
+            rs->push(bfc::shared_sized_buffer::copy_from(s.data.data(), s.data.size()),
+                     lc_type::fec);
+            ws->push(to_buf(s.data, ws->push_offset()));
+        }
+        rs.reset();
+        ws.reset();
+    }
+    /* The streams left the reactor on its thread: it still runs. */
+    std::atomic<bool> ran {false};
+    rr.r->wake_up([&] { ran = true; });
+    EXPECT_TRUE(wait_for([&] { return ran.load(); }));
 }

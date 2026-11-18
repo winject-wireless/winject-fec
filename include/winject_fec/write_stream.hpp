@@ -44,9 +44,15 @@ using write_output_queue = bfc::reactive_circular_lossy_queue<out_shard>;
  * with and closes by its k pushes or its flush; the new ones apply from the next block. With FEC
  * off (k = 0, the default) a push outside a block goes out plain.
  *
- * Threads: the stream runs on its reactor (attach()); calls from other threads are posted onto
- * it. Without a reactor (manual mode) everything runs on the caller's thread, which calls poll()
- * at next_deadline().
+ * Reactor: the stream runs on one (attach()). It is driven by three things there: its input ring,
+ * a bfc lossy ring the reactor drains when a push from another thread lands in it (one mutex, no
+ * allocation; when the reactor falls behind the oldest is dropped, drop_input); its one timer;
+ * and the rare control calls (configure, set_*, poll), posted onto it after the pushes made
+ * before them. A push on the reactor thread runs at once. Without a reactor (manual mode)
+ * everything runs on the caller's thread, which calls poll() at next_deadline().
+ *
+ * Teardown: destroy the stream on its reactor thread or while the reactor still runs (the impl is
+ * handed to the reactor to leave it).
  */
 class fec_write_stream
 {
@@ -80,6 +86,9 @@ public:
     [[nodiscard]] size_t push_offset() const;
     /* Output ring size in shards (default 256). */
     void set_output_capacity(size_t shards);
+    /* Input ring size in datagrams (default 256): pushes from other threads waiting for the
+     * reactor. */
+    void set_input_capacity(size_t datagrams);
 
     /* False (nothing changes) on invalid parameters. Takes effect from the next block. */
     bool configure(const config& cfg);
@@ -87,7 +96,7 @@ public:
     /* Largest app datagram for a config (SIZE_MAX without FEC: the link bounds it). */
     [[nodiscard]] static size_t max_original(const config& cfg);
 
-    /* datagram = [headroom][fec slot][data] (push_offset() bytes before the data). */
+    /* datagram = [headroom][fec slot][data] (push_offset() bytes before the data). Any thread. */
     void push(bfc::shared_sized_buffer datagram);
     /* The next due shard, or type none. Any thread. */
     out_shard                           pop();
@@ -120,12 +129,16 @@ public:
         /* Shards the output ring dropped (oldest first) because the link did not drain it. */
         uint64_t drop_output = 0;
         uint64_t encode_kernel_us = 0;
+        /* Pushes the input ring dropped (oldest first) because the reactor did not drain it. */
+        uint64_t drop_input = 0;
     };
     counters get_counters() const;
 
     struct impl;
 
 private:
+    void control(std::function<void(impl&)> fn);
+
     std::shared_ptr<impl> d;
 };
 

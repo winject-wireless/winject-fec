@@ -2,6 +2,7 @@
 #include "winject_fec/read_stream.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <map>
 #include <utility>
@@ -18,6 +19,7 @@ namespace
 using clock_type = std::chrono::steady_clock;
 
 constexpr size_t k_default_output_capacity = 256;
+constexpr size_t k_default_input_capacity = 256;
 /* How far past a block's data the receiver looks for the next received data shard. */
 constexpr int k_close_scan = 64;
 
@@ -65,6 +67,12 @@ int seq_dist(uint16_t a, uint16_t b)
 
 struct fec_read_stream::impl : std::enable_shared_from_this<impl>
 {
+    struct in_body
+    {
+        bfc::shared_sized_buffer buf;
+        lc_type                  type = lc_type::plain;
+    };
+
     struct rx_slot
     {
         /* The app datagram (received or rebuilt); empty = none. Kept past its release while a
@@ -91,6 +99,8 @@ struct fec_read_stream::impl : std::enable_shared_from_this<impl>
         bool finished = false;
     };
 
+    /* Before link: the reactor points at its ring until link lets go. */
+    detail::stream_input<in_body, impl> in;
     detail::reactor_link               link;
     clock_fn                           clock;
     std::shared_ptr<read_output_queue> out = std::make_shared<read_output_queue>();
@@ -134,11 +144,32 @@ struct fec_read_stream::impl : std::enable_shared_from_this<impl>
 
     stream_counter c_plain, c_data, c_recovered, c_blocks, c_given_up_blocks, c_rs_failures,
         c_evicted, c_missing_data, c_missing_parity, c_late, c_dup, c_new_ref, c_hdr_errors,
-        c_kn_mismatch, c_drop_output;
+        c_kn_mismatch, c_drop_output, c_drop_input;
 
     impl()
     {
         set_output_capacity(k_default_output_capacity);
+        set_input_capacity(k_default_input_capacity);
+    }
+
+    void set_input_capacity(size_t n)
+    {
+        in.set_capacity(n);
+    }
+
+    /* Any thread: queues the body for the reactor (oldest dropped when full). */
+    void enqueue(bfc::shared_sized_buffer&& body, lc_type type)
+    {
+        if (!in.push(in_body {std::move(body), type}))
+        {
+            c_drop_input.add_shared();
+        }
+    }
+
+    /* Stream thread: what other threads gave, in order, before anything after it. */
+    void drain_input()
+    {
+        in.drain(*this, [this](in_body&& b) { push(std::move(b.buf), b.type); });
     }
 
     void set_output_capacity(size_t n)
@@ -889,9 +920,41 @@ struct fec_read_stream::impl : std::enable_shared_from_this<impl>
 
 fec_read_stream::fec_read_stream() : d(std::make_shared<impl>()) {}
 
-/* The timer and posted calls hold the impl weakly or keep it alive themselves, so it is torn
- * down (and its timer cancelled) by whichever thread drops the last reference. */
-fec_read_stream::~fec_read_stream() = default;
+/* As ~fec_write_stream: the input ring leaves the reactor on the reactor thread. */
+fec_read_stream::~fec_read_stream()
+{
+    if (!d || d->link.on_thread())
+    {
+        return;
+    }
+    const auto r = d->link.get();
+    r->wake_up(
+        [d = std::move(d)]
+        {
+            d->link.unbind_input();
+            d->link.disarm();
+        });
+}
+
+/* A control call: on the stream thread, after the pushes queued before it. */
+void fec_read_stream::control(std::function<void(impl&)> fn)
+{
+    if (d->link.on_thread())
+    {
+        d->drain_input();
+        fn(*d);
+        return;
+    }
+    d->in.add_control(std::move(fn));
+    d->link.get()->wake_up(
+        [w = std::weak_ptr<impl>(d)]
+        {
+            if (auto s = w.lock())
+            {
+                s->drain_input();
+            }
+        });
+}
 
 bool fec_read_stream::attach(std::string_view reactor_name)
 {
@@ -907,7 +970,15 @@ bool fec_read_stream::attach(std::string_view reactor_name)
 void fec_read_stream::attach(std::shared_ptr<stream_reactor> reactor)
 {
     d->link.attach(std::move(reactor));
-    d->link.run([d = d] { d->rearm(); });
+    d->link.bind_input(d->in.ring(),
+                       [w = std::weak_ptr<impl>(d)]
+                       {
+                           if (auto s = w.lock())
+                           {
+                               s->drain_input();
+                           }
+                       });
+    control([](impl& s) { s.rearm(); });
 }
 
 void fec_read_stream::set_clock(clock_fn fn)
@@ -917,12 +988,23 @@ void fec_read_stream::set_clock(clock_fn fn)
 
 void fec_read_stream::set_output_capacity(size_t datagrams)
 {
-    d->link.run([d = d, datagrams] { d->set_output_capacity(datagrams); });
+    control([datagrams](impl& s) { s.set_output_capacity(datagrams); });
+}
+
+void fec_read_stream::set_input_capacity(size_t bodies)
+{
+    d->set_input_capacity(bodies);
 }
 
 void fec_read_stream::push(bfc::shared_sized_buffer body, lc_type type)
 {
-    d->link.run([d = d, buf = std::move(body), type]() mutable { d->push(std::move(buf), type); });
+    if (d->link.on_thread())
+    {
+        d->drain_input();
+        d->push(std::move(body), type);
+        return;
+    }
+    d->enqueue(std::move(body), type);
 }
 
 bfc::shared_sized_buffer fec_read_stream::pop()
@@ -938,11 +1020,11 @@ std::shared_ptr<read_output_queue> fec_read_stream::output() const
 
 void fec_read_stream::poll()
 {
-    d->link.run(
-        [d = d]
+    control(
+        [](impl& s)
         {
-            d->service(d->now());
-            d->rearm();
+            s.service(s.now());
+            s.rearm();
         });
 }
 
@@ -953,11 +1035,11 @@ bool fec_read_stream::next_deadline(time_point* at) const
 
 void fec_read_stream::reset()
 {
-    d->link.run(
-        [d = d]
+    control(
+        [](impl& s)
         {
-            d->reset();
-            d->rearm();
+            s.reset();
+            s.rearm();
         });
 }
 
@@ -995,6 +1077,7 @@ fec_read_stream::counters fec_read_stream::get_counters() const
     c.hdr_errors = d->c_hdr_errors.load();
     c.kn_mismatch = d->c_kn_mismatch.load();
     c.drop_output = d->c_drop_output.load();
+    c.drop_input = d->c_drop_input.load();
     return c;
 }
 

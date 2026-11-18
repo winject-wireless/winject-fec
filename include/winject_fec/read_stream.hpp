@@ -42,8 +42,8 @@ using read_output_queue = bfc::reactive_circular_lossy_queue<bfc::shared_sized_b
  * not released; behind by more, or ahead by more than k_max_hi_seq_deviation, it starts a new
  * reference (a new sender session: old state is dropped).
  *
- * Output: a bfc lossy ring (output()); bind it to the consumer's reactor or poll pop(). Threads
- * and manual mode as fec_write_stream.
+ * Output: a bfc lossy ring (output()); bind it to the consumer's reactor or poll pop(). Reactor
+ * (input ring, timer, control calls), manual mode and teardown as fec_write_stream.
  */
 class fec_read_stream
 {
@@ -79,8 +79,12 @@ public:
     void set_clock(clock_fn fn);
     /* Output ring size in datagrams (default 256). */
     void set_output_capacity(size_t datagrams);
+    /* Input ring size in LC bodies (default 256): pushes from other threads waiting for the
+     * reactor. */
+    void set_input_capacity(size_t bodies);
 
-    /* One received LC body: type plain is the payload, type fec a shard of the FEC wire. */
+    /* One received LC body: type plain is the payload, type fec a shard of the FEC wire. Any
+     * thread. */
     void push(bfc::shared_sized_buffer body, lc_type type);
     /* The next app datagram, or an empty buffer. Any thread. */
     bfc::shared_sized_buffer           pop();
@@ -125,12 +129,16 @@ public:
         uint64_t kn_mismatch = 0;
         /* Datagrams the output ring dropped because the consumer did not drain it. */
         uint64_t drop_output = 0;
+        /* Bodies the input ring dropped (oldest first) because the reactor did not drain it. */
+        uint64_t drop_input = 0;
     };
     counters get_counters() const;
 
     struct impl;
 
 private:
+    void control(std::function<void(impl&)> fn);
+
     std::shared_ptr<impl> d;
 };
 
