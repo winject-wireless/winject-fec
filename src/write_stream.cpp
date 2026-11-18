@@ -31,6 +31,9 @@ struct fec_write_stream::impl : std::enable_shared_from_this<impl>
     detail::reactor_link                link;
     clock_fn                            clock;
     block_encoder                       enc;
+    /* enc.push_offset() as the caller sees it: set at once by set_tx_buffers(), while the
+     * encoder takes the change in order with the pushes queued before it. */
+    std::atomic<size_t>                 push_off {enc.push_offset()};
     config                              cfg;   /* for the next block */
     config                              blk;   /* the open block's */
     uint16_t                            tx_seq = 0;
@@ -184,14 +187,17 @@ struct fec_write_stream::impl : std::enable_shared_from_this<impl>
         time_point at {};
         const bool any = next_deadline(&at);
         link.arm(any, at,
-                 [w = weak_from_this()]
+                 [this](uint64_t gen) -> stream_reactor::callback_t
                  {
-                     if (auto s = w.lock())
+                     return [w = weak_from_this(), gen]
                      {
-                         s->link.fired();
-                         s->service(s->now());
-                         s->rearm();
-                     }
+                         auto s = w.lock();
+                         if (s && s->link.fired(gen))
+                         {
+                             s->service(s->now());
+                             s->rearm();
+                         }
+                     };
                  });
     }
 
@@ -236,23 +242,9 @@ struct fec_write_stream::impl : std::enable_shared_from_this<impl>
 
 fec_write_stream::fec_write_stream() : d(std::make_shared<impl>()) {}
 
-/* The reactor walks its contexts (the input ring among them) unlocked, so the ring leaves it on
- * the reactor thread: from another thread the impl is handed to the reactor and torn down there.
- * The timer holds the impl weakly. */
-fec_write_stream::~fec_write_stream()
-{
-    if (!d || d->link.on_thread())
-    {
-        return;
-    }
-    const auto r = d->link.get();
-    r->wake_up(
-        [d = std::move(d)]
-        {
-            d->link.unbind_input();
-            d->link.disarm();
-        });
-}
+/* The timer and the input ring's reactor callback hold the impl weakly; the link takes the ring
+ * off the reactor from whichever thread drops the last reference. */
+fec_write_stream::~fec_write_stream() = default;
 
 /* A control call: on the stream thread, after the pushes queued before it. */
 void fec_write_stream::control(std::function<void(impl&)> fn)
@@ -306,13 +298,14 @@ void fec_write_stream::set_clock(clock_fn fn)
 
 void fec_write_stream::set_tx_buffers(size_t headroom, shard_alloc alloc)
 {
+    d->push_off.store(headroom + k_data_header_len, std::memory_order_relaxed);
     control([headroom, alloc = std::move(alloc)](impl& s) mutable
             { s.enc.set_tx_buffers(headroom, std::move(alloc)); });
 }
 
 size_t fec_write_stream::push_offset() const
 {
-    return d->enc.push_offset();
+    return d->push_off.load(std::memory_order_relaxed);
 }
 
 void fec_write_stream::set_output_capacity(size_t shards)
@@ -352,7 +345,19 @@ bool fec_write_stream::configure(const config& cfg)
         /* Build the full block's encode tables now, not on the stream's first block close. */
         (void)detail::kn_encode_tables_for(cfg.k, cfg.n);
     }
-    control([cfg](impl& s) { s.cfg = cfg; });
+    control(
+        [cfg](impl& s)
+        {
+            s.cfg = cfg;
+            /* An open block without parity has nothing to wait for: the change applies from the
+             * next push, not after k more. */
+            if (s.enc.is_open() && s.blk.n == s.blk.k)
+            {
+                s.enc.close(s.now());
+                s.drain_encoder();
+                s.rearm();
+            }
+        });
     return true;
 }
 

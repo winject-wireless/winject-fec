@@ -333,37 +333,6 @@ TEST(FecStreams, EndToEndWithLossAndSpread)
 
 /* --- on a running reactor --- */
 
-namespace
-{
-
-struct running_reactor
-{
-    std::shared_ptr<stream_reactor> r = std::make_shared<stream_reactor>(10);
-    std::thread                     th {[this] { r->run(); }};
-    ~running_reactor()
-    {
-        r->stop();
-        th.join();
-    }
-};
-
-template <typename F>
-bool wait_for(F f, int timeout_ms = 2000)
-{
-    const auto end = std::chrono::steady_clock::now() + ms(timeout_ms);
-    while (std::chrono::steady_clock::now() < end)
-    {
-        if (f())
-        {
-            return true;
-        }
-        std::this_thread::sleep_for(ms(1));
-    }
-    return f();
-}
-
-}  // namespace
-
 TEST(FecStreamsReactor, WriteStreamTimerReleasesParityAndFlush)
 {
     running_reactor  rr;
@@ -397,7 +366,8 @@ TEST(FecStreamsReactor, WriteStreamTimerReleasesParityAndFlush)
     ws.push(to_buf(make_app(9, 40), ws.push_offset()));
     ASSERT_TRUE(wait_for([&] { take(); return got.size() == 9; }));
     EXPECT_EQ(ws.get_counters().flushed_blocks, 1u);
-    rr.r->remove_read_rdy(*ws.output());
+    /* A consumer's own registration leaves on the reactor thread (bfc walks contexts unlocked). */
+    rr.run_on([&] { rr.r->remove_read_rdy(*ws.output()); });
     (void)bfc::cv_reactor_registry::get_instance().rem("fec_test_tx");
 }
 
@@ -570,4 +540,146 @@ TEST(FecStreamsReactor, DestroyWhileReactorDrains)
     std::atomic<bool> ran {false};
     rr.r->wake_up([&] { ran = true; });
     EXPECT_TRUE(wait_for([&] { return ran.load(); }));
+}
+
+/* --- teardown and the review regressions --- */
+
+/* A consumer's callback on the stream's own reactor destroys the stream while the reactor walks
+ * its contexts, with the stream's input ring later in that walk: the ring must outlive it. */
+TEST(FecStreamsReactor, DestroyFromOwnReactorCallback)
+{
+    running_reactor rr;
+    for (int round = 0; round < 50; round++)
+    {
+        auto       ws = std::make_unique<fec_write_stream>();
+        const auto out = ws->output();
+        std::atomic<bool> gone {false};
+        std::atomic<bool> busy {true};
+        /* The output ring first in the reactor's list, the input ring (attach) after it. */
+        rr.run_on(
+            [&]
+            {
+                out->set_reactor(rr.r);
+                rr.r->add_read_rdy(*out,
+                                   [&]
+                                   {
+                                       rr.r->remove_read_rdy(*out);
+                                       ws.reset();
+                                       gone = true;
+                                   });
+            });
+        ws->attach(rr.r);
+        rr.r->wake_up(
+            [&]
+            {
+                while (busy)
+                {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
+            });
+        const size_t off = ws->push_offset();
+        for (uint32_t i = 0; i < 8; i++)
+        {
+            ws->push(to_buf(make_app(i, 40), off));
+        }
+        busy = false;
+        ASSERT_TRUE(wait_for([&] { return gone.load(); }));
+        rr.run_on([&] { out->set_reactor(nullptr); });
+    }
+}
+
+/* Destroyed off the reactor thread and the reactor stopped right after: nothing keeps the impl
+ * (and through it the output ring) alive. */
+TEST(FecStreamsReactor, DestroyThenStopFreesTheStream)
+{
+    for (int round = 0; round < 50; round++)
+    {
+        std::shared_ptr<write_output_queue> wout;
+        std::shared_ptr<read_output_queue>  rout;
+        {
+            running_reactor rr;
+            {
+                fec_write_stream ws;
+                fec_read_stream  rs;
+                ws.attach(rr.r);
+                rs.attach(rr.r);
+                ASSERT_TRUE(ws.configure(fec_cfg(4, 6, 20, 30)));
+                ws.push(to_buf(make_app(0, 40), ws.push_offset()));
+                wout = ws.output();
+                rout = rs.output();
+            }
+            rr.stop();
+        }
+        EXPECT_EQ(wout.use_count(), 1);
+        EXPECT_EQ(rout.use_count(), 1);
+    }
+}
+
+TEST(FecStreamsReactor, PushOffsetFollowsSetTxBuffersAtOnce)
+{
+    running_reactor  rr;
+    fec_write_stream ws;
+    ws.attach(rr.r);
+    ws.set_tx_buffers(8, nullptr);
+    EXPECT_EQ(ws.push_offset(), 8 + k_data_header_len);
+    ASSERT_TRUE(ws.configure(fec_cfg(2, 3)));
+    for (uint32_t i = 0; i < 2; i++)
+    {
+        ws.push(to_buf(make_app(i, 40), ws.push_offset()));
+    }
+    std::vector<out_shard> got;
+    ASSERT_TRUE(wait_for(
+        [&]
+        {
+            for (auto s = ws.pop(); s.type != shard_type::none; s = ws.pop())
+            {
+                got.push_back(std::move(s));
+            }
+            return got.size() == 3;
+        }));
+    for (uint32_t i = 0; i < 2; i++)
+    {
+        const auto& b = got[i].buf;
+        ASSERT_EQ(got[i].type, shard_type::data);
+        EXPECT_EQ(bytes(b.u8() + 8 + k_data_header_len, b.u8() + b.size()), make_app(i, 40));
+    }
+}
+
+TEST(FecWriteStream, ConfigureClosesOpenDataOnlyBlock)
+{
+    writer w(fec_cfg(8, 8, 0, 0));
+    w.push(make_app(0, 40));
+    EXPECT_EQ(w.pop_all()[0].type, shard_type::data);
+    ASSERT_TRUE(w.ws.configure({})); /* FEC off: applies from the next push */
+    w.push(make_app(1, 40));
+    const auto v = w.pop_all();
+    ASSERT_EQ(v.size(), 1u);
+    EXPECT_EQ(v[0].type, shard_type::plain);
+}
+
+TEST(FecWriteStream, InputCapacityZeroIsOne)
+{
+    running_reactor  rr;
+    fec_write_stream ws;
+    ws.attach(rr.r);
+    ws.set_input_capacity(0);
+    std::atomic<bool> busy {true};
+    std::atomic<bool> entered {false};
+    rr.r->wake_up(
+        [&]
+        {
+            entered = true;
+            while (busy)
+            {
+                std::this_thread::sleep_for(ms(1));
+            }
+        });
+    ASSERT_TRUE(wait_for([&] { return entered.load(); }));
+    for (uint32_t i = 0; i < 5; i++)
+    {
+        ws.push(to_buf(make_app(i, 40), ws.push_offset()));
+    }
+    EXPECT_EQ(ws.get_counters().drop_input, 4u);
+    busy = false;
+    ASSERT_TRUE(wait_for([&] { return ws.pop().type == shard_type::plain; }));
 }

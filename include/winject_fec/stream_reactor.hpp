@@ -1,6 +1,7 @@
 #ifndef WINJECT_FEC_STREAM_REACTOR_HPP
 #define WINJECT_FEC_STREAM_REACTOR_HPP
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -55,6 +56,10 @@ namespace detail
  * reactor drains it when a push wakes it) and one timer armed at the stream's earliest deadline.
  * Without a reactor (manual mode) the caller runs everything on its own thread and drives the
  * deadlines with poll().
+ *
+ * Any thread may tear a link down: the reactor walks a copy of its context list unlocked, so the
+ * ring leaves the list at once but is kept alive by a callback posted to the reactor, which runs
+ * after any walk in flight (or is freed with a stopped reactor; it holds no reference back).
  */
 class reactor_link
 {
@@ -73,29 +78,29 @@ public:
         disarm();
         reactor = std::move(r);
     }
-    /* Registers the input ring: a push wakes the reactor, which calls on_input to drain it. The
-     * reactor keeps a plain pointer to the ring until unbind_input(). */
-    void bind_input(stream_reactor::context& ring, stream_reactor::callback_t on_input)
+    /* Registers the input ring: a push wakes the reactor, which calls on_input to drain it. */
+    void bind_input(std::shared_ptr<stream_reactor::context> ring,
+                    stream_reactor::callback_t                on_input)
     {
         unbind_input();
-        if (!reactor)
+        if (!reactor || !ring)
         {
             return;
         }
-        ring.set_reactor(reactor);
-        (void)reactor->add_read_rdy(ring, std::move(on_input));
-        input = &ring;
+        ring->set_reactor(reactor);
+        (void)reactor->add_read_rdy(*ring, std::move(on_input));
+        input = std::move(ring);
     }
-    /* On the reactor thread (or with the reactor stopped): the reactor walks its contexts
-     * unlocked. */
+    /* Any thread. */
     void unbind_input()
     {
-        if (input != nullptr && reactor)
+        if (input && reactor)
         {
             (void)reactor->remove_read_rdy(*input);
             input->set_reactor(nullptr);
+            reactor->wake_up([keep = std::move(input)] {});
         }
-        input = nullptr;
+        input.reset();
     }
     [[nodiscard]] bool attached() const
     {
@@ -110,9 +115,11 @@ public:
     {
         return !reactor || reactor->is_reactor_thread();
     }
-    /* Arms the one timer for at (none: disarms); cb runs on the reactor thread. Re-arming for
-     * the same deadline keeps the timer. */
-    void arm(bool any, time_point at, std::function<void()> cb)
+    /* Arms the one timer for at (none: disarms). Re-arming for the same deadline keeps the
+     * timer and builds nothing; otherwise make_cb(generation) builds the callback, which runs on
+     * the reactor thread and first asks fired(generation) whether it is still the armed one. */
+    template <typename MakeCb>
+    void arm(bool any, time_point at, MakeCb&& make_cb)
     {
         if (!reactor)
         {
@@ -131,14 +138,21 @@ public:
             0, std::chrono::duration_cast<std::chrono::microseconds>(
                    at - std::chrono::steady_clock::now())
                    .count());
-        timer_id = reactor->get_timer().wait_us(us, std::move(cb));
+        generation++;
+        timer_id = reactor->get_timer().wait_us(us, make_cb(generation));
         armed = true;
         armed_at = at;
     }
-    /* The armed timer fired: it is gone from the reactor. */
-    void fired()
+    /* A timer fired: true (and the timer is gone) when it is the armed one. False for one that
+     * a re-arm replaced after the reactor had already taken it out to run. */
+    bool fired(uint64_t gen)
     {
+        if (!armed || gen != generation)
+        {
+            return false;
+        }
         armed = false;
+        return true;
     }
     void disarm()
     {
@@ -150,11 +164,12 @@ public:
     }
 
 private:
-    std::shared_ptr<stream_reactor> reactor;
-    stream_reactor::context*        input = nullptr;
-    bool                            armed = false;
-    time_point                      armed_at {};
-    stream_reactor::timer_t::timer_id_t timer_id {};
+    std::shared_ptr<stream_reactor>          reactor;
+    std::shared_ptr<stream_reactor::context> input;
+    bool                                     armed = false;
+    uint64_t                                 generation = 0;
+    time_point                               armed_at {};
+    stream_reactor::timer_t::timer_id_t      timer_id {};
 };
 
 }  // namespace detail
@@ -181,12 +196,14 @@ public:
     };
     using ring_t = bfc::reactive_circular_lossy_queue<entry>;
 
+    /* At least one: a ring of none would drop every item uncounted. */
     void set_capacity(size_t n)
     {
-        ring_.set_capacity(n);
+        n = std::max<size_t>(n, 1);
+        ring_->set_capacity(n);
         capacity.store(n, std::memory_order_relaxed);
     }
-    [[nodiscard]] ring_t& ring()
+    [[nodiscard]] const std::shared_ptr<ring_t>& ring() const
     {
         return ring_;
     }
@@ -195,7 +212,7 @@ public:
     {
         const size_t cap = capacity.load(std::memory_order_relaxed);
         const uint64_t t = tickets.fetch_add(1, std::memory_order_relaxed);
-        return !(ring_.push(entry {std::move(item), t}) == cap && cap > 0);
+        return ring_->push(entry {std::move(item), t}) != cap;
     }
     /* Any thread. */
     void add_control(control_fn fn)
@@ -210,7 +227,7 @@ public:
     {
         for (;;)
         {
-            std::optional<entry> e = ring_.pop();
+            std::optional<entry> e = ring_->pop();
             run_controls(owner, e ? e->ticket : UINT64_MAX);
             if (!e)
             {
@@ -239,7 +256,7 @@ private:
         }
     }
 
-    ring_t                                         ring_;
+    std::shared_ptr<ring_t>                        ring_ = std::make_shared<ring_t>();
     std::atomic<size_t>                            capacity {0};
     std::atomic<uint64_t>                          tickets {0};
     std::mutex                                     mtx;

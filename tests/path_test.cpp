@@ -25,29 +25,6 @@ using us = std::chrono::microseconds;
 
 constexpr size_t k_lc_header = 4; /* u8 bus | u8 lc_type | u16 sn */
 
-struct running_reactor
-{
-    std::shared_ptr<stream_reactor> r = std::make_shared<stream_reactor>(10);
-    std::thread                     th {[this] { r->run(); }};
-    ~running_reactor()
-    {
-        r->stop();
-        th.join();
-    }
-    /* Runs fn on the reactor thread and waits for it. */
-    void run_on(std::function<void()> fn)
-    {
-        std::promise<void> done;
-        r->wake_up(
-            [&]
-            {
-                fn();
-                done.set_value();
-            });
-        done.get_future().wait();
-    }
-};
-
 /* As vstreamer's link emulator: per datagram the state moves good -> bad with p_gb and back with
  * p_bg (percent), then the datagram is lost with loss_bad / loss_good percent. */
 struct gilbert_elliott

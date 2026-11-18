@@ -51,8 +51,7 @@ using write_output_queue = bfc::reactive_circular_lossy_queue<out_shard>;
  * before them. A push on the reactor thread runs at once. Without a reactor (manual mode)
  * everything runs on the caller's thread, which calls poll() at next_deadline().
  *
- * Teardown: destroy the stream on its reactor thread or while the reactor still runs (the impl is
- * handed to the reactor to leave it).
+ * Teardown: any thread, the reactor running or not.
  */
 class fec_write_stream
 {
@@ -81,7 +80,7 @@ public:
     void set_clock(clock_fn fn);
 
     /* Room every shard keeps in front for the next layers, and the parity buffer source (heap
-     * when none). Set up before use. */
+     * when none). push_offset() changes at once; pushes queued before keep the old layout. */
     void set_tx_buffers(size_t headroom, shard_alloc alloc);
     [[nodiscard]] size_t push_offset() const;
     /* Output ring size in shards (default 256). */

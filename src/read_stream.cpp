@@ -723,14 +723,17 @@ struct fec_read_stream::impl : std::enable_shared_from_this<impl>
         time_point at {};
         const bool any = next_deadline(&at);
         link.arm(any, at,
-                 [w = weak_from_this()]
+                 [this](uint64_t gen) -> stream_reactor::callback_t
                  {
-                     if (auto s = w.lock())
+                     return [w = weak_from_this(), gen]
                      {
-                         s->link.fired();
-                         s->service(s->now());
-                         s->rearm();
-                     }
+                         auto s = w.lock();
+                         if (s && s->link.fired(gen))
+                         {
+                             s->service(s->now());
+                             s->rearm();
+                         }
+                     };
                  });
     }
 
@@ -920,21 +923,9 @@ struct fec_read_stream::impl : std::enable_shared_from_this<impl>
 
 fec_read_stream::fec_read_stream() : d(std::make_shared<impl>()) {}
 
-/* As ~fec_write_stream: the input ring leaves the reactor on the reactor thread. */
-fec_read_stream::~fec_read_stream()
-{
-    if (!d || d->link.on_thread())
-    {
-        return;
-    }
-    const auto r = d->link.get();
-    r->wake_up(
-        [d = std::move(d)]
-        {
-            d->link.unbind_input();
-            d->link.disarm();
-        });
-}
+/* The timer and the input ring's reactor callback hold the impl weakly; the link takes the ring
+ * off the reactor from whichever thread drops the last reference. */
+fec_read_stream::~fec_read_stream() = default;
 
 /* A control call: on the stream thread, after the pushes queued before it. */
 void fec_read_stream::control(std::function<void(impl&)> fn)

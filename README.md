@@ -80,7 +80,7 @@ with a 16-byte aligned body.
     reactor drains when a push from another thread lands in it (no allocation; the oldest is
     dropped when the reactor falls behind, `drop_input`), and by one timer armed at its earliest
     deadline. Control calls (`configure`, `reset`, `set_*`, `poll`) run in order with the pushes
-    around them. Destroy a stream on its reactor thread or while the reactor runs.
+    around them. A stream may be destroyed from any thread.
   - Output: a `bfc::reactive_circular_lossy_queue` (`output()`). Only due shards enter it, and
     when the consumer does not drain it the oldest is dropped (`drop_output`). Bind it to the
     consumer's reactor (`output()->set_reactor(r)`, `r->add_read_rdy(*output(), cb)`) or poll

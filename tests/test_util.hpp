@@ -13,7 +13,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <future>
+#include <memory>
 #include <random>
+#include <thread>
 #include <vector>
 
 namespace fec_test
@@ -181,6 +185,52 @@ struct receiver
         return rs.get_counters();
     }
 };
+
+/* A reactor on its own thread for the tests that run the streams for real. */
+struct running_reactor
+{
+    std::shared_ptr<stream_reactor> r = std::make_shared<stream_reactor>(10);
+    std::thread                     th {[this] { r->run(); }};
+    ~running_reactor()
+    {
+        stop();
+    }
+    void stop()
+    {
+        if (th.joinable())
+        {
+            r->stop();
+            th.join();
+        }
+    }
+    /* Runs fn on the reactor thread and waits for it. */
+    void run_on(const std::function<void()>& fn)
+    {
+        std::promise<void> done;
+        r->wake_up(
+            [&]
+            {
+                fn();
+                done.set_value();
+            });
+        done.get_future().wait();
+    }
+};
+
+template <typename F>
+bool wait_for(F f, int timeout_ms = 2000)
+{
+    const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < end)
+    {
+        if (f())
+        {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return f();
+}
 
 }  // namespace fec_test
 
