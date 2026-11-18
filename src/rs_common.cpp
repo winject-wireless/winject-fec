@@ -3,8 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <map>
 #include <mutex>
-#include <optional>
+#include <utility>
 
 #if defined(ESP_PLATFORM) && __has_include("sdkconfig.h")
 #include "sdkconfig.h"
@@ -26,26 +27,27 @@ namespace winject::fec::detail
 
 const kn_encode_tables& kn_encode_tables_for(int k, int total)
 {
-    static std::mutex mu;
-    static std::array<std::array<std::optional<kn_encode_tables>, k_max_rows + 1>, k_max_k + 1>
-                                cache;
-    std::lock_guard<std::mutex> lock(mu);
-    std::optional<kn_encode_tables>& slot =
-        cache[static_cast<size_t>(k)][static_cast<size_t>(total)];
-    if (!slot.has_value())
+    /* Only the (k, total) pairs in use, on the heap: a table for every pair would be ~56 KB of
+     * static RAM, which on the ESP32-P4 is internal RAM the H.264 encoder needs. Map nodes never
+     * move, so the returned reference stays valid. */
+    static std::mutex                                       mu;
+    static std::map<std::pair<int, int>, kn_encode_tables> cache;
+    std::lock_guard<std::mutex>                             lock(mu);
+    const auto                                              found = cache.find({k, total});
+    if (found != cache.end())
     {
-        kn_encode_tables built;
-        const int        p = total - k;
-        built.encode_matrix.assign(static_cast<size_t>(total) * static_cast<size_t>(k), 0);
-        built.g_tbls.assign(static_cast<size_t>(k) * static_cast<size_t>(std::max(p, 1)) * 32, 0);
-        gf_gen_cauchy1_matrix(built.encode_matrix.data(), total, k);
-        if (p > 0)
-        {
-            ec_init_tables_base(k, p, built.encode_matrix.data() + k * k, built.g_tbls.data());
-        }
-        slot = std::move(built);
+        return found->second;
     }
-    return *slot;
+    kn_encode_tables built;
+    const int        p = total - k;
+    built.encode_matrix.assign(static_cast<size_t>(total) * static_cast<size_t>(k), 0);
+    built.g_tbls.assign(static_cast<size_t>(k) * static_cast<size_t>(std::max(p, 1)) * 32, 0);
+    gf_gen_cauchy1_matrix(built.encode_matrix.data(), total, k);
+    if (p > 0)
+    {
+        ec_init_tables_base(k, p, built.encode_matrix.data() + k * k, built.g_tbls.data());
+    }
+    return cache.emplace(std::make_pair(k, total), std::move(built)).first->second;
 }
 
 int gen_decode_matrix(int k, int total, const uint8_t* encode_matrix, const uint8_t* err_list,
