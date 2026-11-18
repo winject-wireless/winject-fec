@@ -5,7 +5,7 @@
 # this repo fetches its own pin with the default config in bfc_config/.
 include_guard(GLOBAL)
 
-set(WINJECT_FEC_BFC_PIN 8dc02add56771bf05f60519b3915c8fc9464d24b)
+set(WINJECT_FEC_BFC_PIN 804b986b10d142c2f6ed0cd93bfbfcad8c73c8a6)
 
 if(DEFINED BFC_PIN AND NOT "${BFC_PIN}" STREQUAL "${WINJECT_FEC_BFC_PIN}")
     message(FATAL_ERROR "winject-fec pins bfc ${WINJECT_FEC_BFC_PIN}, but the build uses bfc ${BFC_PIN}. Bump one pin to match.")
